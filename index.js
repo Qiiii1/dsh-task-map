@@ -26,6 +26,6 @@ export async function apply(ctx) {
     stateSchema: schema,
     init: initialPlan,
     apply: projectPlan,
-    wire: { viewSchema: schema, view: state => state, summary: false },
+    wire: { viewSchema: schema, view: state => state, summary: true },
   })
 }

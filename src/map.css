@@ -167,3 +167,17 @@ body[data-ds-dark-theme] .tm-shell {
 @media (prefers-reduced-motion: reduce) {
   .tm-shell *, .tm-shell *::before, .tm-shell *::after { transition: none !important; animation: none !important; }
 }
+
+/* 回答进行中：目标卡片高亮 + 呼吸 */
+.tm-node[data-live] { animation: tm-pulse 1.6s ease-in-out infinite; }
+.tm-node[data-live] .tm-card { border-color: var(--tm-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--tm-accent) 42%, transparent), 0 2px 14px var(--tm-shadow); }
+.tm-node[data-live][data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 14px var(--tm-shadow); }
+/* 状态切换与自动完成 */
+.tm-status-row { display: flex; gap: 4px; margin: 8px 0 4px; }
+.tm-status-chip { flex: 1; min-height: 26px; padding: 3px 6px; border: 1px solid var(--tm-line); border-radius: 6px; background: var(--tm-card); color: var(--tm-muted); font-size: 11px; font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .04em; transition: color .16s, border-color .16s, background .16s; }
+.tm-status-chip:hover { border-color: var(--tm-text); color: var(--tm-text); }
+.tm-status-chip[aria-pressed="true"] { background: var(--tm-text); border-color: var(--tm-text); color: var(--tm-panel); }
+.tm-auto { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0 6px; padding: 5px 8px; border: 1px dashed color-mix(in srgb, var(--tm-accent) 45%, var(--tm-line)); border-radius: 6px; color: var(--tm-accent); font-size: 11px; }
+.tm-auto-toggle { display: flex; align-items: center; gap: 7px; margin: 4px 0 10px; color: var(--tm-muted); font-size: 11px; cursor: pointer; }
+.tm-auto-toggle input { accent-color: var(--tm-accent); }
+@media (prefers-reduced-motion: reduce) { .tm-node[data-live] { animation: none; } }

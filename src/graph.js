@@ -35,6 +35,7 @@ function makeGraph(todos, edits) {
   }))].map(node => {
     const edit = edits.overrides[node.id]
     return { ...node, title: edit?.title ?? node.title, detail: edit?.detail ?? '',
+      status: edit?.status ?? node.status, autoDone: edit?.autoDone === true, statusEdited: edit?.status !== undefined,
       sourceTitle: node.title, guides: edit?.guides ?? [],
       position: edit?.position, preferredParents: edit?.parents ?? node.parents, parents: [] }
   })

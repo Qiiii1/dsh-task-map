@@ -70,7 +70,7 @@ window.__ModuleLoader__.load({
           h('small', { className: 'tm-build' }, 'build ' + buildStamp)))
     }
 
-    function Canvas({ nodes, title, selected, select, add, connect, move, remove, onBlank, openGuide }) {
+    function Canvas({ nodes, title, selected, select, add, connect, move, remove, onBlank, openGuide, running, activeId }) {
       const viewport = useRef(null)
       const gesture = useRef(null)
       const ignoreClick = useRef(false)
@@ -275,8 +275,9 @@ window.__ModuleLoader__.load({
           const root = node.id === ROOT
           const p = positionOf(node.id)
           const current = selected === node.id
+          const live = !root && running && activeId === node.id
           return h('div', { className: 'tm-node', key: node.id, style: { left: p.x, top: p.y },
-            'data-root': root || undefined, 'data-status': node.status,
+            'data-root': root || undefined, 'data-status': node.status, 'data-live': live || undefined,
             'data-selected': current || undefined,
             'data-muted': !root && selected && !focusPath.has(node.id) || undefined },
           !root && h('span', {
@@ -299,8 +300,8 @@ window.__ModuleLoader__.load({
           h('span', { className: 'tm-card-top' },
             h('span', { className: 'tm-kind' }, root ? icons('map', 17) :
               h('span', { className: 'tm-card-no' }, String(index).padStart(2, '0'))),
-            root ? '任务' : node.source ? statusLabels[node.status] : '手动步骤',
-            !root && node.status === 'in_progress' && h('span', { className: 'tm-live', 'aria-label': '进行中' }),
+            root ? '任务' : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
+            !root && (live || node.status === 'in_progress') && h('span', { className: 'tm-live', 'aria-label': live ? '正在回答' : '进行中' }),
             !root && icons('grip', 15)),
           h('span', { className: 'tm-card-title' }, node.title),
           !root && h('span', { className: 'tm-card-foot' },
@@ -326,7 +327,7 @@ window.__ModuleLoader__.load({
         h(Action, { icon: 'fit', label: '适配画布', onClick: () => { manual.current = false; fit() } })))
     }
 
-    function Inspector({ node, nodes, close, update, remove, sending, canSend, running, send, notification, guideFocus }) {
+    function Inspector({ node, nodes, close, update, remove, sending, canSend, running, send, notification, guideFocus, autoComplete, onAutoComplete }) {
       const [guide, setGuide] = useState('')
       const [approval, setApproval] = useState(true)
       const [error, setError] = useState('')
@@ -391,6 +392,18 @@ window.__ModuleLoader__.load({
           h(Action, { icon: 'close', label: '关闭节点详情', onClick: close })),
         h('div', { className: 'tm-node-meta' }, icons(statusIcons[node.status]),
           node.source ? statusLabels[node.status] : '手动步骤'),
+        h('div', { className: 'tm-status-row', role: 'group', 'aria-label': '步骤状态' },
+          ['pending', 'in_progress', 'completed'].map(value => h('button', {
+            key: value, type: 'button', className: 'tm-status-chip', 'aria-pressed': node.status === value,
+            onClick: () => update({ status: value, autoDone: false }),
+          }, statusLabels[value]))),
+        node.autoDone && h('div', { className: 'tm-auto' },
+          h('span', null, '回答结束，已自动标完成'),
+          h(Action, { text: '撤销', onClick: () => update({ status: undefined, autoDone: false }) })),
+        h('label', { className: 'tm-auto-toggle' },
+          h('input', { type: 'checkbox', checked: autoComplete,
+            onChange: event => onAutoComplete(event.target.checked) }),
+          '回答结束后自动标完成'),
         editing ? h('form', { className: 'tm-edit', onSubmit: save },
           h('label', null, '步骤标题', h('input', { autoFocus: true, value: title, required: true, maxLength: 240,
             onChange: e => setTitle(e.target.value) })),
@@ -449,8 +462,26 @@ window.__ModuleLoader__.load({
       const [guideFocus, setGuideFocus] = useState(null)
       const [requestError, setRequestError] = useState('')
       const [planRequested, setPlanRequested] = useState(false)
+      const [active, setActive] = useState(null)
       const requestLock = useRef(false)
       const nodes = useMemo(() => makeGraph(todos, edits), [todos, edits])
+      const activeRef = useRef(null)
+      const nodesRef = useRef(nodes)
+      const wasRunning = useRef(running)
+      activeRef.current = active
+      nodesRef.current = nodes
+      useEffect(() => {
+        const ended = wasRunning.current && !running
+        wasRunning.current = running
+        if (!ended) return
+        const id = activeRef.current?.id
+        const target = id ? nodesRef.current.find(item => item.id === id) : null
+        if (!target || target.status === 'completed' || editsRef.current.autoComplete === false) return
+        commit(previous => ({
+          ...previous,
+          overrides: { ...previous.overrides, [id]: { ...previous.overrides[id], status: 'completed', autoDone: true } },
+        }))
+      }, [running])
       const node = nodes.find(n => n.id === selected)
       const visibleSelection = node ? node.id : selected === ROOT ? ROOT : null
       const completed = todos.filter(item => item.status === 'completed').length
@@ -539,6 +570,7 @@ window.__ModuleLoader__.load({
           return { ...previous, overrides: { ...previous.overrides, [target.id]: record } }
         })
         setNote({ id: target.id, text: '已发送' })
+        setActive({ id: target.id, at: Date.now() })
       }
 
       async function requestPlan() {
@@ -546,6 +578,7 @@ window.__ModuleLoader__.load({
         try {
           await submit('【任务地图 规划】\n请将我当前的任务用 Harness 的 todo_write 工具拆解为具体步骤，记录真实完成状态。请先停在规划阶段，等我确认计划或发送 Guide 后再继续执行。', 'queue')
           setPlanRequested(true)
+          setActive({ id: null, at: Date.now() })
         } catch (reason) {
           setRequestError(reason instanceof Error ? reason.message : '请求规划失败，请重试。')
         }
@@ -562,8 +595,11 @@ window.__ModuleLoader__.load({
             h(Usage, { usage }))),
         h('div', { className: 'tm-workbench' },
           h(Canvas, { nodes, title, selected: visibleSelection, select: choose, add, connect, remove, openGuide,
+            running, activeId: active?.id,
             move: (id, position) => modify(id, { position }), onBlank: () => choose(null) }),
           node && h(Inspector, { key: node.id, node, nodes, running, sending, canSend, guideFocus,
+            autoComplete: edits.autoComplete !== false,
+            onAutoComplete: value => commit(previous => ({ ...previous, autoComplete: value })),
             close: () => choose(null), update: value => modify(node.id, value),
             remove: () => remove(node.id), send: sendGuide, notification: note?.id === node.id ? note.text : '' }),
           !node && h('aside', { className: 'tm-inspector tm-empty', 'aria-label': '任务概览' },
@@ -578,6 +614,8 @@ window.__ModuleLoader__.load({
 
     function TaskMapView({ useProjection, useSession, useAccess, sessionId, sendPrompt, openView }) {
       const projection = useProjection('dshTaskMap') ?? EMPTY_PLAN
+      const canonicalTodos = useProjection('todos')
+      const sessionTitle = useProjection('title')
       const usage = useProjection('tokenUsage')
       const running = useSession(s => s.running)
       const sessionReady = useSession(s => s.openState === 'open' && !s.removed && !s.subagent)
@@ -585,9 +623,11 @@ window.__ModuleLoader__.load({
       const current = projection.task ?? projection.plan
       const plan = projection.plan?.key === current?.key ? projection.plan : null
       const identity = current?.key ?? 'conversation'
+      const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : plan?.todos ?? EMPTY_TODOS
       return h(Workbench, {
         key: sessionId + ':' + identity, sessionId, identity,
-        todos: plan?.todos ?? EMPTY_TODOS, title: current?.title || '当前会话任务', usage, running, canSend,
+        todos, title: current?.title || (typeof sessionTitle === 'string' ? sessionTitle : '') || '当前会话任务',
+        usage, running, canSend,
         sendPrompt, openChat: () => openView('chat', ''),
       })
     }
