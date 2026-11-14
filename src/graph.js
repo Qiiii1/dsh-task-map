@@ -1,13 +1,13 @@
-const ROOT = 'task'
 const CARD_W = 232
 const CARD_H = 126
 const GAP_X = 88
 const GAP_Y = 42
+const GROUP_GAP = 96
+const ROOT = 'task'
 const EMPTY_EDITS = { overrides: {}, added: [] }
 
-function todoId(content) {
-  return 'todo:' + content
-}
+const rootId = key => key === ROOT ? ROOT : 'root:' + key
+const todoId = (key, content) => 'todo:' + key + ':' + content
 
 function directParents(id, nodes) {
   return nodes.find(node => node.id === id)?.parents ?? []
@@ -25,67 +25,113 @@ function ancestors(id, nodes) {
   return found
 }
 
-function makeGraph(todos, edits) {
-  const source = todos.map((todo, index) => ({
-    id: todoId(todo.content), title: todo.content, status: todo.status, source: true,
-    parents: [index === 0 ? ROOT : todoId(todos[index - 1].content)],
-  }))
-  const nodes = [...source, ...edits.added.map(node => ({
-    ...node, parents: [ROOT], status: 'pending', source: false,
-  }))].map(node => {
-    const edit = edits.overrides[node.id]
-    return { ...node, title: edit?.title ?? node.title, detail: edit?.detail ?? '',
-      status: edit?.status ?? node.status, autoDone: edit?.autoDone === true, statusEdited: edit?.status !== undefined,
-      sourceTitle: node.title, guides: edit?.guides ?? [],
-      position: edit?.position, preferredParents: edit?.parents ?? node.parents, parents: [] }
-  })
-  const ids = new Set([ROOT, ...nodes.map(node => node.id)])
-  // A new AI todo order can conflict with locally edited edges. Keep explicit
-  // dependencies first, and fall back to the task root when a parent disappeared.
-  const ordered = [...nodes].sort((a, b) => Number(!!edits.overrides[b.id]?.parents) - Number(!!edits.overrides[a.id]?.parents))
-  for (const node of ordered) {
-    node.parents = [...new Set(node.preferredParents)].filter(parent =>
-      parent !== node.id && ids.has(parent) && !ancestors(parent, nodes).has(node.id))
-    if (node.parents.length === 0) node.parents = [ROOT]
+// 每段对话（mission）一棵「任务 → 步骤」小树，画布上纵向叠放；手动方块挂在最近一段上。
+function makeGraph(groups, edits) {
+  const items = []
+  let order = 0
+  for (const group of groups) {
+    const id = rootId(group.key)
+    items.push({
+      id, key: group.key, group: group.key, root: true, order: items.filter(item => item.root).length + 1,
+      title: group.title || '任务', status: 'pending', parents: [], guides: [],
+    })
+    const todos = Array.isArray(group.todos) ? group.todos : []
+    todos.forEach((todo, index) => {
+      items.push({
+        id: todoId(group.key, todo.content), key: group.key, group: group.key, root: false, order: ++order,
+        title: todo.content, status: todo.status, source: true,
+        parents: [index === 0 ? id : todoId(group.key, todos[index - 1].content)],
+      })
+    })
   }
-  return nodes
+  const roots = items.filter(item => item.root)
+  const fallbackRoot = roots.length ? roots[roots.length - 1].id : ROOT
+  const fallbackGroup = roots.length ? roots[roots.length - 1].key : ROOT
+  for (const added of edits.added) {
+    items.push({
+      ...added, root: false, key: added.group ?? fallbackGroup, group: added.group ?? fallbackGroup,
+      order: ++order, parents: [fallbackRoot], status: 'pending', source: false, guides: [],
+    })
+  }
+  const ids = new Set(items.map(item => item.id))
+  for (const item of items) {
+    if (item.root) {
+      item.parents = []
+      continue
+    }
+    const edit = edits.overrides[item.id]
+    item.sourceTitle = item.title
+    item.title = edit?.title ?? item.title
+    item.detail = edit?.detail ?? ''
+    item.status = edit?.status ?? item.status
+    item.autoDone = edit?.autoDone === true
+    item.statusEdited = edit?.status !== undefined
+    item.guides = edit?.guides ?? []
+    item.position = edit?.position
+    item.preferredParents = edit?.parents ?? item.parents
+    item.parents = []
+  }
+  // A new AI todo order can conflict with locally edited edges. Keep explicit
+  // dependencies first, and fall back to the latest task root when a parent disappeared.
+  const ordered = items.filter(item => !item.root)
+    .sort((a, b) => Number(!!edits.overrides[b.id]?.parents) - Number(!!edits.overrides[a.id]?.parents))
+  for (const item of ordered) {
+    item.parents = [...new Set(item.preferredParents)].filter(parent =>
+      parent !== item.id && ids.has(parent) && !ancestors(parent, items).has(item.id))
+    if (item.parents.length === 0) item.parents = [fallbackRoot]
+  }
+  return items
 }
 
-function layout(nodes) {
-  const lookup = new Map(nodes.map(node => [node.id, node]))
-  const levels = new Map([[ROOT, 0]])
-  function level(id) {
-    if (!levels.has(id)) levels.set(id, 1 + Math.max(...lookup.get(id).parents.map(level)))
-    return levels.get(id)
-  }
-  const columns = new Map()
-  const positions = new Map([[ROOT, { x: 0, y: 0 }]])
-  for (const node of nodes) {
-    const column = level(node.id)
-    if (!columns.has(column)) columns.set(column, [])
-    columns.get(column).push(node)
-  }
-  // Fold long plans across the canvas so early and late steps are visible
-  // together. Within one depth, nodes sit in parallel.
-  const last = Math.max(0, ...columns.keys())
-  const columnsPerRow = 3
-  let rowY = 0
-  for (let first = 0; first <= last; first += columnsPerRow) {
-    const row = first / columnsPerRow
-    const count = Math.min(columnsPerRow, last - first + 1)
-    let height = CARD_H
-    for (let offset = 0; offset < count; offset++) {
-      const column = first + offset
-      const group = columns.get(column) ?? []
-      const columnX = row % 2 === 0 ? offset : columnsPerRow - 1 - offset
-      height = Math.max(height, group.length * (CARD_H + GAP_Y) - GAP_Y)
-      group.forEach((node, index) => positions.set(node.id, node.position ?? {
-        x: columnX * (CARD_W + GAP_X),
-        y: rowY + index * (CARD_H + GAP_Y),
-      }))
+function layout(items) {
+  const positions = new Map()
+  const roots = items.filter(item => item.root)
+  let yOffset = 0
+  for (const root of roots) {
+    const group = items.filter(item => !item.root && item.group === root.group)
+    const lookup = new Map([[root.id, root], ...group.map(item => [item.id, item])])
+    const levels = new Map([[root.id, 0]])
+    const level = id => {
+      if (!levels.has(id)) {
+        const parents = lookup.get(id)?.parents.filter(parent => lookup.has(parent)) ?? []
+        levels.set(id, parents.length ? 1 + Math.max(...parents.map(level)) : 1)
+      }
+      return levels.get(id)
     }
-    rowY += height + 100
+    const columns = new Map()
+    positions.set(root.id, { x: 0, y: yOffset })
+    for (const item of group) {
+      const column = level(item.id)
+      if (!columns.has(column)) columns.set(column, [])
+      columns.get(column).push(item)
+    }
+    // Fold long plans across the canvas so early and late steps are visible
+    // together. Within one depth, nodes sit in parallel.
+    const last = Math.max(0, ...columns.keys())
+    const columnsPerRow = 3
+    let rowY = 0
+    for (let first = 0; first <= last; first += columnsPerRow) {
+      const row = first / columnsPerRow
+      const count = Math.min(columnsPerRow, last - first + 1)
+      let height = CARD_H
+      for (let offset = 0; offset < count; offset++) {
+        const column = first + offset
+        const bucket = columns.get(column) ?? []
+        const columnX = row % 2 === 0 ? offset : columnsPerRow - 1 - offset
+        height = Math.max(height, bucket.length * (CARD_H + GAP_Y) - GAP_Y)
+        bucket.forEach((item, index) => positions.set(item.id, item.position ?? {
+          x: columnX * (CARD_W + GAP_X),
+          y: yOffset + rowY + index * (CARD_H + GAP_Y),
+        }))
+      }
+      rowY += height + 100
+    }
+    yOffset += rowY + GROUP_GAP
   }
+  const loose = items.filter(item => !positions.has(item.id))
+  loose.forEach((item, index) => positions.set(item.id, item.position ?? {
+    x: 0, y: yOffset + index * (CARD_H + GAP_Y),
+  }))
   return positions
 }
 
@@ -101,20 +147,21 @@ function readEdits(key) {
 
 function guidePrompt({ node, nodes, approval, guide }) {
   const before = ancestors(node.id, nodes)
-  const after = nodes.filter(next => ancestors(next.id, nodes).has(node.id))
+  const upstream = nodes.filter(item => !item.root && before.has(item.id))
+  const after = nodes.filter(next => !next.root && ancestors(next.id, nodes).has(node.id))
   const stepName = item => item.detail ? item.title + '（' + item.detail + '）' : item.title
   const stepList = items => items.map(item => '- ' + stepName(item)).join('\n')
   const editedDependencies = [node, ...after].flatMap(item => {
-    const parents = item.parents.map(id => nodes.find(candidate => candidate.id === id)).filter(Boolean)
+    const parents = item.parents.map(id => nodes.find(candidate => candidate.id === id)).filter(candidate => candidate && !candidate.root)
     return parents.length ? ['- ' + item.title + ' ← ' + parents.map(parent => parent.title).join('、')] : []
   })
   return [
     '【任务地图 Guide】',
     node.source ? '目标步骤：' + stepName(node) : '引导对象：以下步骤',
     node.source && node.title !== node.sourceTitle ? 'DeepSeek 原待办：' + node.sourceTitle : '',
-    approval && before.size > Number(before.has(ROOT))
+    approval && upstream.length
       ? '我认可以下上游步骤及已完成的成果。保留已有成果，尚未完成的前置步骤请按原计划完成。\n'
-        + stepList(nodes.filter(item => before.has(item.id)))
+        + stepList(upstream)
       : '',
     guide ? '我的引导：\n' + guide : '',
     after.length ? '下游步骤：\n' + stepList(after) : '',

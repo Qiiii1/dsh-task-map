@@ -82,6 +82,7 @@ window.__ModuleLoader__.load({
       const positions = useMemo(() => layout(nodes), [nodes])
       const bounds = useMemo(() => {
         const points = [...positions.values()]
+        if (!points.length) return { left: 0, top: 0, right: CARD_W, bottom: CARD_H }
         return {
           left: Math.min(...points.map(p => p.x)), top: Math.min(...points.map(p => p.y)),
           right: Math.max(...points.map(p => p.x)) + CARD_W,
@@ -92,6 +93,7 @@ window.__ModuleLoader__.load({
       const next = useMemo(() => new Set(nodes.filter(node => node.parents.includes(selected)).map(node => node.id)), [selected, nodes])
       const focusPath = new Set([...upper, ...next, selected])
       const approved = new Set(nodes.flatMap(node => node.guides.flatMap(item => item.approvedIds ?? [])))
+      const rootIds = useMemo(() => new Set(nodes.filter(node => node.root).map(node => node.id)), [nodes])
 
       function fit() {
         const box = viewport.current
@@ -189,7 +191,7 @@ window.__ModuleLoader__.load({
         if (event.key === 'Delete' || event.key === 'Backspace') {
           const id = event.target.dataset?.node
           const target = id && nodes.find(item => item.id === id)
-          if (target && !target.source) {
+          if (target && !target.root && !target.source) {
             event.preventDefault()
             remove(id)
           }
@@ -199,7 +201,7 @@ window.__ModuleLoader__.load({
         event.preventDefault()
         manual.current = true
         const id = event.target.dataset.node
-        if (id && id !== ROOT) {
+        if (id && !rootIds.has(id)) {
           const pos = positions.get(id)
           move(id, { x: pos.x + direction[0] * 16, y: pos.y + direction[1] * 16 })
           return
@@ -230,6 +232,7 @@ window.__ModuleLoader__.load({
         if (!link) return
         const at = worldPoint(event)
         const target = nodes.find(item => {
+          if (item.root) return false
           const spot = positionOf(item.id)
           return spot && at.x >= spot.x && at.x <= spot.x + CARD_W && at.y >= spot.y && at.y <= spot.y + CARD_H
         })
@@ -271,8 +274,9 @@ window.__ModuleLoader__.load({
           })),
           link && h('path', { className: 'tm-link', d: 'M' + (positionOf(link.from).x + CARD_W) + ' ' + (positionOf(link.from).y + CARD_H / 2)
             + 'L' + link.x + ' ' + link.y })),
-        [{ id: ROOT, title }, ...nodes].map((node, index) => {
-          const root = node.id === ROOT
+        nodes.map(node => {
+          const root = node.root === true
+          const index = node.order ?? 0
           const p = positionOf(node.id)
           const current = selected === node.id
           const live = !root && running && activeId === node.id
@@ -294,13 +298,13 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button', className: 'tm-card', title: node.title, 'data-node': node.id,
             'aria-pressed': current, onPointerDown: event => { if (!root) { event.stopPropagation(); start(event, node.id) } },
-            onClick: () => { if (!ignoreClick.current) select(node.id); ignoreClick.current = false },
+            onClick: () => { if (!ignoreClick.current && !root) select(node.id); ignoreClick.current = false },
             onDoubleClick: () => openGuide(node.id),
           },
           h('span', { className: 'tm-card-top' },
             h('span', { className: 'tm-kind' }, root ? icons('map', 17) :
               h('span', { className: 'tm-card-no' }, String(index).padStart(2, '0'))),
-            root ? '任务' : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
+            root ? '任务 ' + String(index).padStart(2, '0') : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
             !root && (live || node.status === 'in_progress') && h('span', { className: 'tm-live', 'aria-label': live ? '正在回答' : '进行中' }),
             !root && icons('grip', 15)),
           h('span', { className: 'tm-card-title' }, node.title),
@@ -341,14 +345,17 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (guideFocus) guideRef.current?.focus()
       }, [guideFocus])
+      const rootIds = new Set(nodes.filter(item => item.root).map(item => item.id))
       const before = ancestors(node.id, nodes)
-      const hasUpstream = [...before].some(id => id !== ROOT)
-      const eligible = nodes.filter(item => item.id !== node.id && !ancestors(item.id, nodes).has(node.id))
+      const hasUpstream = [...before].some(id => !rootIds.has(id))
+      const eligible = nodes.filter(item => !item.root && item.group === node.group && item.id !== node.id
+        && !ancestors(item.id, nodes).has(node.id))
 
       function toggleParent(id) {
-        const other = node.parents.filter(parent => parent !== ROOT)
+        const fallback = node.parents.find(parent => rootIds.has(parent)) ?? [...rootIds][0] ?? ROOT
+        const other = node.parents.filter(parent => !rootIds.has(parent))
         const parents = other.includes(id) ? other.filter(parent => parent !== id) : [...other, id]
-        update({ parents: parents.length ? parents : [ROOT] })
+        update({ parents: parents.length ? parents : [fallback] })
       }
 
       function save(event) {
@@ -417,7 +424,7 @@ window.__ModuleLoader__.load({
             node.detail && h('p', null, node.detail),
             h(Action, { className: 'tm-edit-link', text: '编辑步骤', onClick: () => setEditing(true) })),
         h('details', { className: 'tm-dependencies' },
-          h('summary', null, '前置依赖', h('span', null, node.parents.includes(ROOT) ? '任务起点' : node.parents.length + ' 个节点')),
+          h('summary', null, '前置依赖', h('span', null, node.parents.some(parent => rootIds.has(parent)) ? '任务起点' : node.parents.length + ' 个节点')),
           h('div', { className: 'tm-parent-list' }, eligible.length
             ? eligible.map(item => h('label', { key: item.id },
               h('input', { type: 'checkbox', checked: node.parents.includes(item.id), onChange: () => toggleParent(item.id) }),
@@ -449,14 +456,19 @@ window.__ModuleLoader__.load({
           h('ol', null, node.guides.map(item => h('li', { key: item.id },
             item.approval && h('strong', null, '认可上游'),
             item.text && h('p', null, item.text))))),
-        !node.source && h(Action, { className: 'tm-remove', text: '删除方块', disabled: sending, onClick: remove }))
+        !node.root && !node.source && h(Action, { className: 'tm-remove', text: '删除方块', disabled: sending, onClick: remove }))
     }
 
-    function Workbench({ sessionId, identity, todos, title, usage, running, canSend, sendPrompt, openChat }) {
+    function Workbench({ sessionId, identity, groups, title, usage, running, canSend, sendPrompt, openChat }) {
       const storageKey = 'dsh-task-map:v1:' + sessionId + ':' + identity
+      const allTodos = groups.flatMap(group => Array.isArray(group.todos) ? group.todos : [])
       const [edits, setEdits] = useState(() => readEdits(storageKey))
       const editsRef = useRef(edits)
-      const [selected, setSelected] = useState(() => todos.length ? todoId((todos.find(item => item.status === 'in_progress') ?? todos[0]).content) : ROOT)
+      const [selected, setSelected] = useState(() => {
+        const latest = groups[groups.length - 1]
+        if (!latest || !latest.todos?.length) return null
+        return todoId(latest.key, (latest.todos.find(item => item.status === 'in_progress') ?? latest.todos[0]).content)
+      })
       const [sending, setSending] = useState(false)
       const [note, setNote] = useState(null)
       const [guideFocus, setGuideFocus] = useState(null)
@@ -464,7 +476,7 @@ window.__ModuleLoader__.load({
       const [planRequested, setPlanRequested] = useState(false)
       const [active, setActive] = useState(null)
       const requestLock = useRef(false)
-      const nodes = useMemo(() => makeGraph(todos, edits), [todos, edits])
+      const nodes = useMemo(() => makeGraph(groups, edits), [groups, edits])
       const activeRef = useRef(null)
       const nodesRef = useRef(nodes)
       const wasRunning = useRef(running)
@@ -484,7 +496,7 @@ window.__ModuleLoader__.load({
       }, [running])
       const node = nodes.find(n => n.id === selected)
       const visibleSelection = node ? node.id : selected === ROOT ? ROOT : null
-      const completed = todos.filter(item => item.status === 'completed').length
+      const completed = allTodos.filter(item => item.status === 'completed').length
 
       function commit(edit) {
         const value = edit(editsRef.current)
@@ -510,9 +522,11 @@ window.__ModuleLoader__.load({
 
       function add(position) {
         const id = 'manual:' + globalThis.crypto.randomUUID()
+        const roots = nodes.filter(item => item.root)
+        const fallback = roots.length ? roots[roots.length - 1].id : ROOT
         commit(previous => ({
-          added: [...previous.added, { id, title: '新方块' }],
-          overrides: { ...previous.overrides, [id]: { parents: [ROOT], ...(position ? { position } : {}) } },
+          added: [...previous.added, { id, title: '新方块', group: roots.length ? roots[roots.length - 1].key : ROOT }],
+          overrides: { ...previous.overrides, [id]: { parents: [fallback], ...(position ? { position } : {}) } },
         }))
         setSelected(id)
         setGuideFocus({ at: globalThis.crypto.randomUUID() })
@@ -522,7 +536,7 @@ window.__ModuleLoader__.load({
         const target = nodes.find(item => item.id === to)
         if (!target || from === to) return
         if (ancestors(from, nodes).has(to)) return
-        const parents = [...target.parents.filter(parent => parent !== from && parent !== ROOT), from]
+        const parents = [...target.parents.filter(parent => parent !== from && !nodes.some(item => item.id === parent && item.root)), from]
         modify(to, { parents })
         setSelected(to)
       }
@@ -564,7 +578,7 @@ window.__ModuleLoader__.load({
           running ? 'steer' : 'queue', images)
         commit(previous => {
           const last = previous.overrides[target.id]
-          const approvedIds = approval ? [...ancestors(target.id, nodes)].filter(id => id !== ROOT) : []
+          const approvedIds = approval ? [...ancestors(target.id, nodes)].filter(id => !nodes.some(item => item.id === id && item.root)) : []
           const entry = { id: globalThis.crypto.randomUUID(), text: guide, approval, approvedIds }
           const record = { ...last, guides: [...(last?.guides ?? []), entry] }
           return { ...previous, overrides: { ...previous.overrides, [target.id]: record } }
@@ -590,7 +604,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'tm-heading-main' },
             h('span', { className: 'tm-logo' }, icons('map', 22)),
             h('div', null, h('h2', null, '任务地图', running && h('span', { className: 'tm-live', 'aria-label': '正在运行' })),
-              todos.length ? h('p', null, completed + ' / ' + todos.length) : null)),
+              allTodos.length ? h('p', null, completed + ' / ' + allTodos.length) : null)),
           h('div', { className: 'tm-heading-actions' },
             h(Usage, { usage }))),
         h('div', { className: 'tm-workbench' },
@@ -605,8 +619,8 @@ window.__ModuleLoader__.load({
           !node && h('aside', { className: 'tm-inspector tm-empty', 'aria-label': '任务概览' },
             h('div', { className: 'tm-inspector-head' }, h('span', null, '任务概览')),
             h('p', { className: 'tm-task-text' }, title),
-            !todos.length && h('h3', null, planRequested ? '已请求规划' : '等待规划'),
-            !todos.length && h(Action, { icon: 'refresh', text: sending ? '请求中…' : running ? 'DeepSeek 正在运行' : '请求规划',
+            !allTodos.length && h('h3', null, planRequested ? '已请求规划' : '等待规划'),
+            !allTodos.length && h(Action, { icon: 'refresh', text: sending ? '请求中…' : running ? 'DeepSeek 正在运行' : '请求规划',
               className: 'tm-primary', disabled: sending || running || !canSend, onClick: requestPlan }),
             requestError && h('p', { className: 'tm-error', role: 'alert' }, requestError),
             h(Action, { className: 'tm-back', text: '返回对话', onClick: openChat }))))
@@ -620,13 +634,19 @@ window.__ModuleLoader__.load({
       const running = useSession(s => s.running)
       const sessionReady = useSession(s => s.openState === 'open' && !s.removed && !s.subagent)
       const canSend = useAccess('session/prompt') !== false && sessionReady
-      const current = projection.task ?? projection.plan
-      const plan = projection.plan?.key === current?.key ? projection.plan : null
-      const identity = current?.key ?? 'conversation'
-      const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : plan?.todos ?? EMPTY_TODOS
+      const missions = Array.isArray(projection.missions) ? projection.missions : []
+      const groups = missions
+        .filter(mission => Array.isArray(mission.todos) && mission.todos.length)
+        .map(mission => ({ key: mission.key, title: mission.title }))
+      if (!groups.length) {
+        const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : projection.plan?.todos ?? EMPTY_TODOS
+        if (todos.length) groups.push({ key: projection.plan?.key ?? 'current', title: projection.task?.title ?? projection.plan?.title ?? '' })
+      }
+      const latest = missions[missions.length - 1]
+      const title = latest?.title || projection.task?.title || projection.plan?.title
       return h(Workbench, {
-        key: sessionId + ':' + identity, sessionId, identity,
-        todos, title: current?.title || (typeof sessionTitle === 'string' ? sessionTitle : '') || '当前会话任务',
+        key: sessionId + ':history', sessionId, identity: 'history',
+        groups, title: title || (typeof sessionTitle === 'string' ? sessionTitle : '') || '当前会话任务',
         usage, running, canSend,
         sendPrompt, openChat: () => openView('chat', ''),
       })

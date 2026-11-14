@@ -7,12 +7,21 @@ function validTask(task) {
   return task === null || (typeof task?.key === 'string' && typeof task.title === 'string')
 }
 
+function validTodos(todos) {
+  return Array.isArray(todos) && todos.every(item => typeof item?.content === 'string'
+    && ['pending', 'in_progress', 'completed'].includes(item.status))
+}
+
+function validMission(mission) {
+  return typeof mission?.key === 'string' && typeof mission.title === 'string'
+    && (mission.todos === null || validTodos(mission.todos))
+}
+
 const schema = {
   parse(value) {
     if (!value || !validTask(value.task) || !validTask(value.plan)
-      || (value.plan && (!Array.isArray(value.plan.todos) || value.plan.todos.some(
-        item => typeof item?.content !== 'string' || !['pending', 'in_progress', 'completed'].includes(item.status),
-      )))) {
+      || (value.plan && !validTodos(value.plan.todos))
+      || (value.missions !== undefined && (!Array.isArray(value.missions) || !value.missions.every(validMission)))) {
       throw new TypeError('Invalid task map projection')
     }
     return value

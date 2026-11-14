@@ -2,16 +2,16 @@ window.__ModuleLoader__.load({
   id: 'dsh-task-map',
   factory(require) {
     const { createElement: h, useEffect, useLayoutEffect, useMemo, useRef, useState } = require('react')
-    const ROOT = 'task'
     const CARD_W = 232
     const CARD_H = 126
     const GAP_X = 88
     const GAP_Y = 42
+    const GROUP_GAP = 96
+    const ROOT = 'task'
     const EMPTY_EDITS = { overrides: {}, added: [] }
 
-    function todoId(content) {
-      return 'todo:' + content
-    }
+    const rootId = key => key === ROOT ? ROOT : 'root:' + key
+    const todoId = (key, content) => 'todo:' + key + ':' + content
 
     function directParents(id, nodes) {
       return nodes.find(node => node.id === id)?.parents ?? []
@@ -29,67 +29,113 @@ window.__ModuleLoader__.load({
       return found
     }
 
-    function makeGraph(todos, edits) {
-      const source = todos.map((todo, index) => ({
-        id: todoId(todo.content), title: todo.content, status: todo.status, source: true,
-        parents: [index === 0 ? ROOT : todoId(todos[index - 1].content)],
-      }))
-      const nodes = [...source, ...edits.added.map(node => ({
-        ...node, parents: [ROOT], status: 'pending', source: false,
-      }))].map(node => {
-        const edit = edits.overrides[node.id]
-        return { ...node, title: edit?.title ?? node.title, detail: edit?.detail ?? '',
-          status: edit?.status ?? node.status, autoDone: edit?.autoDone === true, statusEdited: edit?.status !== undefined,
-          sourceTitle: node.title, guides: edit?.guides ?? [],
-          position: edit?.position, preferredParents: edit?.parents ?? node.parents, parents: [] }
-      })
-      const ids = new Set([ROOT, ...nodes.map(node => node.id)])
-      // A new AI todo order can conflict with locally edited edges. Keep explicit
-      // dependencies first, and fall back to the task root when a parent disappeared.
-      const ordered = [...nodes].sort((a, b) => Number(!!edits.overrides[b.id]?.parents) - Number(!!edits.overrides[a.id]?.parents))
-      for (const node of ordered) {
-        node.parents = [...new Set(node.preferredParents)].filter(parent =>
-          parent !== node.id && ids.has(parent) && !ancestors(parent, nodes).has(node.id))
-        if (node.parents.length === 0) node.parents = [ROOT]
+    // 每段对话（mission）一棵「任务 → 步骤」小树，画布上纵向叠放；手动方块挂在最近一段上。
+    function makeGraph(groups, edits) {
+      const items = []
+      let order = 0
+      for (const group of groups) {
+        const id = rootId(group.key)
+        items.push({
+          id, key: group.key, group: group.key, root: true, order: items.filter(item => item.root).length + 1,
+          title: group.title || '任务', status: 'pending', parents: [], guides: [],
+        })
+        const todos = Array.isArray(group.todos) ? group.todos : []
+        todos.forEach((todo, index) => {
+          items.push({
+            id: todoId(group.key, todo.content), key: group.key, group: group.key, root: false, order: ++order,
+            title: todo.content, status: todo.status, source: true,
+            parents: [index === 0 ? id : todoId(group.key, todos[index - 1].content)],
+          })
+        })
       }
-      return nodes
+      const roots = items.filter(item => item.root)
+      const fallbackRoot = roots.length ? roots[roots.length - 1].id : ROOT
+      const fallbackGroup = roots.length ? roots[roots.length - 1].key : ROOT
+      for (const added of edits.added) {
+        items.push({
+          ...added, root: false, key: added.group ?? fallbackGroup, group: added.group ?? fallbackGroup,
+          order: ++order, parents: [fallbackRoot], status: 'pending', source: false, guides: [],
+        })
+      }
+      const ids = new Set(items.map(item => item.id))
+      for (const item of items) {
+        if (item.root) {
+          item.parents = []
+          continue
+        }
+        const edit = edits.overrides[item.id]
+        item.sourceTitle = item.title
+        item.title = edit?.title ?? item.title
+        item.detail = edit?.detail ?? ''
+        item.status = edit?.status ?? item.status
+        item.autoDone = edit?.autoDone === true
+        item.statusEdited = edit?.status !== undefined
+        item.guides = edit?.guides ?? []
+        item.position = edit?.position
+        item.preferredParents = edit?.parents ?? item.parents
+        item.parents = []
+      }
+      // A new AI todo order can conflict with locally edited edges. Keep explicit
+      // dependencies first, and fall back to the latest task root when a parent disappeared.
+      const ordered = items.filter(item => !item.root)
+        .sort((a, b) => Number(!!edits.overrides[b.id]?.parents) - Number(!!edits.overrides[a.id]?.parents))
+      for (const item of ordered) {
+        item.parents = [...new Set(item.preferredParents)].filter(parent =>
+          parent !== item.id && ids.has(parent) && !ancestors(parent, items).has(item.id))
+        if (item.parents.length === 0) item.parents = [fallbackRoot]
+      }
+      return items
     }
 
-    function layout(nodes) {
-      const lookup = new Map(nodes.map(node => [node.id, node]))
-      const levels = new Map([[ROOT, 0]])
-      function level(id) {
-        if (!levels.has(id)) levels.set(id, 1 + Math.max(...lookup.get(id).parents.map(level)))
-        return levels.get(id)
-      }
-      const columns = new Map()
-      const positions = new Map([[ROOT, { x: 0, y: 0 }]])
-      for (const node of nodes) {
-        const column = level(node.id)
-        if (!columns.has(column)) columns.set(column, [])
-        columns.get(column).push(node)
-      }
-      // Fold long plans across the canvas so early and late steps are visible
-      // together. Within one depth, nodes sit in parallel.
-      const last = Math.max(0, ...columns.keys())
-      const columnsPerRow = 3
-      let rowY = 0
-      for (let first = 0; first <= last; first += columnsPerRow) {
-        const row = first / columnsPerRow
-        const count = Math.min(columnsPerRow, last - first + 1)
-        let height = CARD_H
-        for (let offset = 0; offset < count; offset++) {
-          const column = first + offset
-          const group = columns.get(column) ?? []
-          const columnX = row % 2 === 0 ? offset : columnsPerRow - 1 - offset
-          height = Math.max(height, group.length * (CARD_H + GAP_Y) - GAP_Y)
-          group.forEach((node, index) => positions.set(node.id, node.position ?? {
-            x: columnX * (CARD_W + GAP_X),
-            y: rowY + index * (CARD_H + GAP_Y),
-          }))
+    function layout(items) {
+      const positions = new Map()
+      const roots = items.filter(item => item.root)
+      let yOffset = 0
+      for (const root of roots) {
+        const group = items.filter(item => !item.root && item.group === root.group)
+        const lookup = new Map([[root.id, root], ...group.map(item => [item.id, item])])
+        const levels = new Map([[root.id, 0]])
+        const level = id => {
+          if (!levels.has(id)) {
+            const parents = lookup.get(id)?.parents.filter(parent => lookup.has(parent)) ?? []
+            levels.set(id, parents.length ? 1 + Math.max(...parents.map(level)) : 1)
+          }
+          return levels.get(id)
         }
-        rowY += height + 100
+        const columns = new Map()
+        positions.set(root.id, { x: 0, y: yOffset })
+        for (const item of group) {
+          const column = level(item.id)
+          if (!columns.has(column)) columns.set(column, [])
+          columns.get(column).push(item)
+        }
+        // Fold long plans across the canvas so early and late steps are visible
+        // together. Within one depth, nodes sit in parallel.
+        const last = Math.max(0, ...columns.keys())
+        const columnsPerRow = 3
+        let rowY = 0
+        for (let first = 0; first <= last; first += columnsPerRow) {
+          const row = first / columnsPerRow
+          const count = Math.min(columnsPerRow, last - first + 1)
+          let height = CARD_H
+          for (let offset = 0; offset < count; offset++) {
+            const column = first + offset
+            const bucket = columns.get(column) ?? []
+            const columnX = row % 2 === 0 ? offset : columnsPerRow - 1 - offset
+            height = Math.max(height, bucket.length * (CARD_H + GAP_Y) - GAP_Y)
+            bucket.forEach((item, index) => positions.set(item.id, item.position ?? {
+              x: columnX * (CARD_W + GAP_X),
+              y: yOffset + rowY + index * (CARD_H + GAP_Y),
+            }))
+          }
+          rowY += height + 100
+        }
+        yOffset += rowY + GROUP_GAP
       }
+      const loose = items.filter(item => !positions.has(item.id))
+      loose.forEach((item, index) => positions.set(item.id, item.position ?? {
+        x: 0, y: yOffset + index * (CARD_H + GAP_Y),
+      }))
       return positions
     }
 
@@ -105,20 +151,21 @@ window.__ModuleLoader__.load({
 
     function guidePrompt({ node, nodes, approval, guide }) {
       const before = ancestors(node.id, nodes)
-      const after = nodes.filter(next => ancestors(next.id, nodes).has(node.id))
+      const upstream = nodes.filter(item => !item.root && before.has(item.id))
+      const after = nodes.filter(next => !next.root && ancestors(next.id, nodes).has(node.id))
       const stepName = item => item.detail ? item.title + '（' + item.detail + '）' : item.title
       const stepList = items => items.map(item => '- ' + stepName(item)).join('\n')
       const editedDependencies = [node, ...after].flatMap(item => {
-        const parents = item.parents.map(id => nodes.find(candidate => candidate.id === id)).filter(Boolean)
+        const parents = item.parents.map(id => nodes.find(candidate => candidate.id === id)).filter(candidate => candidate && !candidate.root)
         return parents.length ? ['- ' + item.title + ' ← ' + parents.map(parent => parent.title).join('、')] : []
       })
       return [
         '【任务地图 Guide】',
         node.source ? '目标步骤：' + stepName(node) : '引导对象：以下步骤',
         node.source && node.title !== node.sourceTitle ? 'DeepSeek 原待办：' + node.sourceTitle : '',
-        approval && before.size > Number(before.has(ROOT))
+        approval && upstream.length
           ? '我认可以下上游步骤及已完成的成果。保留已有成果，尚未完成的前置步骤请按原计划完成。\n'
-            + stepList(nodes.filter(item => before.has(item.id)))
+            + stepList(upstream)
           : '',
         guide ? '我的引导：\n' + guide : '',
         after.length ? '下游步骤：\n' + stepList(after) : '',
@@ -130,7 +177,7 @@ window.__ModuleLoader__.load({
     }
 
     const css = "/* 灰底 + 白卡 + 蓝色强调，Nothing 式留白/等宽微标签/细边框；浅色与深色各一套。 */\n.tm-shell {\n  --tm-paper: #e8e8e9;\n  --tm-panel: #f7f7f8;\n  --tm-text: #111112;\n  --tm-muted: #6b6b70;\n  --tm-line: #d5d5d8;\n  --tm-dot: #cececf;\n  --tm-soft: #ededee;\n  --tm-accent: #1a4fe0;\n  --tm-accent-hover: #143fb8;\n  --tm-card: #ffffff;\n  --tm-wire: #b6b6ba;\n  --tm-done: #f0f0f1;\n  --tm-live: #fff4f2;\n  --tm-error: #c0201a;\n  --tm-shadow: #11111210;\n  --tm-pulse: #e02b20;\n  container-type: inline-size;\n  box-sizing: border-box;\n  width: min(calc(100% - 32px), 1440px);\n  margin: 10px auto 20px;\n  border: 1px solid var(--tm-line);\n  border-radius: 16px;\n  overflow: clip;\n  color: var(--tm-text);\n  background: var(--tm-panel);\n  font: var(--dsw-font-size-text, 14px)/1.55 Inter, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif;\n  text-align: left;\n}\nbody[data-ds-dark-theme] .tm-shell {\n  --tm-paper: #101011;\n  --tm-panel: #161617;\n  --tm-text: #f2f2f3;\n  --tm-muted: #9a9aa0;\n  --tm-line: #2b2b2e;\n  --tm-dot: #2f2f33;\n  --tm-soft: #1f1f22;\n  --tm-accent: #7aa2ff;\n  --tm-accent-hover: #a3c0ff;\n  --tm-card: #1b1b1d;\n  --tm-wire: #4a4a50;\n  --tm-done: #1e1e20;\n  --tm-live: #241a1a;\n  --tm-error: #ff8b83;\n  --tm-shadow: #00000055;\n  --tm-pulse: #ff5449;\n}\n.tm-shell *, .tm-shell *::before, .tm-shell *::after { box-sizing: border-box; }\n.tm-shell h2, .tm-shell h3, .tm-shell p, .tm-shell dl { margin: 0; }\n.tm-shell button, .tm-shell textarea, .tm-shell input { font: inherit; }\n.tm-shell button, .tm-shell summary { color: inherit; cursor: pointer; }\n.tm-shell button:disabled { cursor: default; opacity: .52; }\n.tm-shell :focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 3px; }\n.tm-heading { display: flex; min-height: 74px; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--tm-line); background: var(--tm-panel); }\n.tm-heading-main, .tm-heading-actions { display: flex; align-items: center; gap: 12px; }\n.tm-heading h2 { display: flex; align-items: center; gap: 9px; font-size: 17px; letter-spacing: .02em; font-weight: 640; line-height: 1.35; }\n.tm-heading p { font-size: 11px; color: var(--tm-muted); font-family: ui-monospace, \"SF Mono\", Menlo, monospace; letter-spacing: .06em; margin-top: 2px; }\n.tm-logo { display: grid; place-items: center; width: 38px; height: 38px; color: var(--tm-text); background: var(--tm-soft); border: 1px solid var(--tm-line); border-radius: 8px; }\n.tm-usage { position: relative; z-index: 5; }\n.tm-usage summary { display: flex; align-items: center; gap: 7px; min-height: 36px; list-style: none; padding: 6px 10px; border: 1px solid var(--tm-line); border-radius: 7px; font-variant-numeric: tabular-nums; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; font-size: 11px; }\n.tm-usage summary::-webkit-details-marker { display: none; }\n.tm-usage small { color: var(--tm-muted); font-size: 10px; letter-spacing: .04em; }\n.tm-usage-pop { position: absolute; right: 0; top: calc(100% + 8px); width: 210px; background: var(--tm-card); border: 1px solid var(--tm-line); border-radius: 10px; padding: 14px; box-shadow: 0 10px 30px var(--tm-shadow); }\n.tm-usage-pop dl { display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; margin-top: 8px; font-size: 11px; color: var(--tm-muted); font-variant-numeric: tabular-nums; }\n.tm-usage-pop dd { margin: 0; color: var(--tm-text); }\n.tm-build { display: block; margin-top: 9px; color: var(--tm-muted); font-size: 10px; letter-spacing: .06em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-workbench { display: grid; grid-template-columns: minmax(0, 1fr) 288px; height: clamp(475px, 64vh, 690px); }\n.tm-stage { isolation: isolate; position: relative; min-height: 0; overflow: hidden; background-color: var(--tm-paper); background-image: radial-gradient(circle, var(--tm-dot) .9px, transparent 1.1px); background-size: 22px 22px; touch-action: none; cursor: grab; }\n.tm-stage:active { cursor: grabbing; }\n.tm-stage:focus-visible { outline-offset: -3px; }\n.tm-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }\n.tm-edges { width: 1px; height: 1px; position: absolute; overflow: visible; pointer-events: none; }\n.tm-edges path { fill: none; stroke: var(--tm-wire); stroke-width: 1.4; }\n.tm-edges circle { fill: var(--tm-wire); }\n.tm-edges [data-path=\"active\"] path { stroke: var(--tm-accent); stroke-width: 2.2; }\n.tm-edges [data-path=\"active\"] circle { fill: var(--tm-accent); }\n.tm-edges .tm-link { stroke: var(--tm-accent); stroke-width: 1.8; stroke-dasharray: 5 5; }\n.tm-node { position: absolute; width: 232px; height: 126px; }\n.tm-node[data-selected] { z-index: 2; }\n.tm-node[data-status=\"in_progress\"] { animation: tm-pulse 2.4s ease-in-out infinite; }\n.tm-card { color: inherit; display: flex; flex-direction: column; align-items: stretch; text-align: left; gap: 8px; width: 100%; height: 100%; padding: 12px 14px; border: 1px solid var(--tm-line); background: var(--tm-card); border-radius: 10px; box-shadow: 0 2px 10px var(--tm-shadow); transition: border-color .16s, background .16s, box-shadow .16s; overflow: hidden; }\n.tm-card:hover, .tm-node[data-selected] .tm-card { border-color: var(--tm-accent); }\n.tm-node[data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 10px var(--tm-shadow); }\n.tm-node[data-root] .tm-card { color: var(--tm-text); background: var(--tm-soft); }\n.tm-node[data-status=\"completed\"] .tm-card { background: var(--tm-done); }\n.tm-node[data-status=\"in_progress\"] .tm-card { background: var(--tm-live); border-color: color-mix(in srgb, var(--tm-pulse) 42%, var(--tm-line)); }\n.tm-node[data-muted] .tm-card { background: var(--tm-card); box-shadow: none; opacity: .62; }\n.tm-card-top { display: flex; align-items: center; gap: 8px; color: var(--tm-muted); font-size: 11px; letter-spacing: .04em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; text-transform: uppercase; }\n.tm-card-top > svg { margin-left: auto; }\n.tm-kind { display: grid; place-items: center; width: 22px; height: 22px; color: var(--tm-text); border: 1px solid var(--tm-line); border-radius: 5px; background: var(--tm-card); flex-shrink: 0; }\n.tm-card-no { font-size: 10px; font-variant-numeric: tabular-nums; }\n.tm-card-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; font-size: 15px; font-weight: 620; line-height: 1.4; letter-spacing: -.01em; }\n.tm-card-foot { display: flex; align-items: center; gap: 6px; color: var(--tm-muted); font-size: 10px; letter-spacing: .04em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; line-height: 1.2; margin-top: auto; white-space: nowrap; overflow: hidden; }\n.tm-card-foot svg { flex-shrink: 0; }\n.tm-live { display: inline-block; width: 7px; height: 7px; border-radius: 2px; background: var(--tm-pulse); flex-shrink: 0; animation: tm-blink 1.05s steps(1, end) infinite; }\n.tm-heading h2 .tm-live { margin-left: 2px; }\n.tm-card-delete { position: absolute; z-index: 4; top: -9px; right: -9px; width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 1px solid var(--tm-line); border-radius: 5px; background: var(--tm-card); color: var(--tm-muted); opacity: 0; transform: scale(.92); transition: opacity .14s, color .14s, border-color .14s, transform .14s; }\n.tm-node:hover .tm-card-delete, .tm-node[data-selected] .tm-card-delete { opacity: 1; transform: none; }\n.tm-card-delete:hover { color: var(--tm-error); border-color: var(--tm-error); }\n.tm-port { position: absolute; z-index: 3; right: -6px; top: calc(50% - 6px); width: 12px; height: 12px; padding: 0; border: 1.5px solid var(--tm-line); border-radius: 3px; background: var(--tm-card); cursor: crosshair; transition: border-color .16s, background .16s, transform .16s; }\n.tm-port:hover, .tm-node[data-selected] .tm-port { border-color: var(--tm-accent); background: var(--tm-accent); transform: scale(1.1); }\n.tm-dock { cursor: default; position: absolute; z-index: 3; display: flex; align-items: center; gap: 1px; left: 50%; bottom: 16px; transform: translateX(-50%); padding: 4px; border: 1px solid var(--tm-line); border-radius: 11px; background: color-mix(in srgb, var(--tm-panel) 90%, transparent); backdrop-filter: blur(12px); box-shadow: 0 6px 20px var(--tm-shadow); }\n.tm-zoom { font-size: 11px; color: var(--tm-muted); min-width: 42px; text-align: center; font-variant-numeric: tabular-nums; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-dock-divider { width: 1px; height: 18px; background: var(--tm-line); margin: 0 3px; }\n.tm-shell .tm-block-add { display: inline-flex; align-items: center; justify-content: center; width: 32px; min-height: 32px; padding: 0; border: 1px solid var(--tm-text); border-radius: 6px; background: var(--tm-text); color: var(--tm-panel); transition: background .16s, border-color .16s, color .16s; }\n.tm-shell .tm-block-add:hover { background: var(--tm-accent); border-color: var(--tm-accent); color: #fff; }\n.tm-shell .tm-block-add:active { background: var(--tm-accent-hover); border-color: var(--tm-accent-hover); }\n.tm-button { min-height: 32px; min-width: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 5px 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; transition: background .16s ease, color .16s ease; }\n.tm-button:hover:not(:disabled) { background: var(--tm-soft); }\n.tm-button:active:not(:disabled) { filter: brightness(.94); }\n.tm-shell .tm-primary { background: var(--tm-text); color: var(--tm-panel); min-height: 38px; font-weight: 620; }\n.tm-shell .tm-primary:hover:not(:disabled) { background: var(--tm-accent); color: #fff; }\n.tm-inspector { min-width: 0; overflow: auto; border-left: 1px solid var(--tm-line); padding: 15px 17px 22px; background: var(--tm-panel); overscroll-behavior: contain; }\n.tm-inspector-head { display: flex; justify-content: space-between; align-items: center; min-height: 33px; color: var(--tm-muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-inspector-head .tm-button { margin-right: -5px; }\n.tm-node-meta { display: flex; align-items: center; gap: 5px; font-size: 11px; letter-spacing: .04em; color: var(--tm-accent); margin: 11px 0 5px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-inspector h3 { font-size: 16px; font-weight: 660; line-height: 1.45; overflow-wrap: anywhere; letter-spacing: -.01em; }\n.tm-inspector p { overflow-wrap: anywhere; }\n.tm-detail-title > p, .tm-empty > p { margin-top: 6px; font-size: 13px; color: var(--tm-muted); white-space: pre-wrap; }\n.tm-shell .tm-edit-link { color: var(--tm-accent); padding-left: 0; margin: 3px 0; font-size: 12px; }\n.tm-edit, .tm-guide { display: grid; gap: 9px; }\n.tm-edit label { display: grid; gap: 5px; }\n.tm-form-actions { display: flex; justify-content: end; gap: 5px; margin-bottom: 8px; }\n.tm-dependencies, .tm-history { border-top: 1px solid var(--tm-line); padding: 6px 0; font-size: 13px; }\n.tm-dependencies summary, .tm-history summary { min-height: 34px; padding-top: 7px; }\n.tm-dependencies summary span, .tm-history summary span { float: right; color: var(--tm-muted); margin-left: 4px; font-size: 11px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-parent-list { display: grid; gap: 5px; max-height: 128px; overflow: auto; padding: 4px 0 8px; font-size: 12px; color: var(--tm-muted); }\n.tm-parent-list label, .tm-approval { display: flex; gap: 7px; align-items: start; cursor: pointer; }\n.tm-shell input[type=\"checkbox\"] { accent-color: var(--tm-accent); margin-top: 3px; flex-shrink: 0; }\n.tm-guide { border-top: 1px solid var(--tm-line); padding: 13px 0; }\n.tm-guide-label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-weight: 640; }\n.tm-shell textarea, .tm-shell input:not([type=\"checkbox\"]) { width: 100%; resize: vertical; padding: 9px; border: 1px solid var(--tm-line); border-radius: 7px; color: var(--tm-text); background: var(--tm-card); font-size: 13px; }\n.tm-shell textarea { min-height: 58px; margin-top: 2px; font-weight: 400; }\n.tm-shell textarea::placeholder { color: var(--tm-muted); opacity: 1; }\n.tm-media { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }\n.tm-thumb { position: relative; display: block; width: 54px; height: 54px; border-radius: 6px; overflow: hidden; border: 1px solid var(--tm-line); background: var(--tm-soft); }\n.tm-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }\n.tm-shell .tm-thumb-remove { position: absolute; right: 2px; top: 2px; width: 17px; height: 17px; min-width: 0; min-height: 0; display: grid; place-items: center; padding: 0; border: 0; border-radius: 3px; background: #111112cc; color: #fff; }\n.tm-media-add { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 0 9px; border: 1px dashed var(--tm-line); border-radius: 6px; background: transparent; color: var(--tm-muted); font-size: 12px; }\n.tm-media-add:hover:not(:disabled) { border-color: var(--tm-accent); color: var(--tm-accent); }\n.tm-shell input.tm-file { position: absolute; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; }\n.tm-approval { font-size: 13px; }\n.tm-send { justify-content: space-between; text-align: left; font-size: 12px !important; }\n.tm-error { color: var(--tm-error); font-size: 12px; }\n.tm-notice { color: var(--tm-accent); font-size: 12px; }\n.tm-empty h3 { margin-top: 12px; }\n.tm-empty .tm-task-text { max-height: 6em; overflow: auto; color: var(--tm-text); }\n.tm-empty .tm-button { margin-top: 11px; }\n.tm-back { color: var(--tm-accent) !important; }\n.tm-history ol { display: grid; gap: 7px; padding-left: 19px; margin: 3px 0 8px; }\n.tm-history p { white-space: pre-wrap; font-size: 12px; }\n.tm-shell .tm-remove { color: var(--tm-error); font-size: 12px; padding-left: 0; }\n@keyframes tm-blink { 0%, 100% { opacity: 1; } 50% { opacity: .12; } }\n@keyframes tm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .74; } }\n@container (max-width: 690px) {\n  .tm-workbench { height: auto; grid-template-columns: minmax(0, 1fr); }\n  .tm-stage { height: 360px; }\n  .tm-inspector { border-left: 0; border-top: 1px solid var(--tm-line); overflow: visible; }\n}\n@container (max-width: 420px) {\n  .tm-heading { padding: 10px 12px; min-height: 62px; }\n  .tm-heading h2 { font-size: 15px; }\n  .tm-logo { width: 32px; height: 32px; }\n  .tm-stage { height: 305px; }\n}\n@media (prefers-reduced-motion: reduce) {\n  .tm-shell *, .tm-shell *::before, .tm-shell *::after { transition: none !important; animation: none !important; }\n}\n\n/* 回答进行中：目标卡片高亮 + 呼吸 */\n.tm-node[data-live] { animation: tm-pulse 1.6s ease-in-out infinite; }\n.tm-node[data-live] .tm-card { border-color: var(--tm-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--tm-accent) 42%, transparent), 0 2px 14px var(--tm-shadow); }\n.tm-node[data-live][data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 14px var(--tm-shadow); }\n/* 状态切换与自动完成 */\n.tm-status-row { display: flex; gap: 4px; margin: 8px 0 4px; }\n.tm-status-chip { flex: 1; min-height: 26px; padding: 3px 6px; border: 1px solid var(--tm-line); border-radius: 6px; background: var(--tm-card); color: var(--tm-muted); font-size: 11px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; letter-spacing: .04em; transition: color .16s, border-color .16s, background .16s; }\n.tm-status-chip:hover { border-color: var(--tm-text); color: var(--tm-text); }\n.tm-status-chip[aria-pressed=\"true\"] { background: var(--tm-text); border-color: var(--tm-text); color: var(--tm-panel); }\n.tm-auto { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0 6px; padding: 5px 8px; border: 1px dashed color-mix(in srgb, var(--tm-accent) 45%, var(--tm-line)); border-radius: 6px; color: var(--tm-accent); font-size: 11px; }\n.tm-auto-toggle { display: flex; align-items: center; gap: 7px; margin: 4px 0 10px; color: var(--tm-muted); font-size: 11px; cursor: pointer; }\n.tm-auto-toggle input { accent-color: var(--tm-accent); }\n@media (prefers-reduced-motion: reduce) { .tm-node[data-live] { animation: none; } }\n"
-    const buildStamp = "c9154839"
+    const buildStamp = "0afcb57a"
     const locales = {"zh":{"name":"任务地图","meta":{"title":"任务地图","description":"在当前会话查看 DeepSeek 待办的节点地图，编辑步骤与依赖，发送节点 Guide 并查看会话 token 用量。"}},"en":{"name":"Task map","meta":{"title":"Task map","description":"View this session’s DeepSeek plan as a map, edit steps and dependencies, send node guides, and inspect session token usage."}}}
     const glyphs = {
       map: 'M4 5h5v5H4zM15 3h5v5h-5zM15 16h5v5h-5zM9 7.5h3v11h3M12 5.5h3',
@@ -207,6 +254,7 @@ window.__ModuleLoader__.load({
       const positions = useMemo(() => layout(nodes), [nodes])
       const bounds = useMemo(() => {
         const points = [...positions.values()]
+        if (!points.length) return { left: 0, top: 0, right: CARD_W, bottom: CARD_H }
         return {
           left: Math.min(...points.map(p => p.x)), top: Math.min(...points.map(p => p.y)),
           right: Math.max(...points.map(p => p.x)) + CARD_W,
@@ -217,6 +265,7 @@ window.__ModuleLoader__.load({
       const next = useMemo(() => new Set(nodes.filter(node => node.parents.includes(selected)).map(node => node.id)), [selected, nodes])
       const focusPath = new Set([...upper, ...next, selected])
       const approved = new Set(nodes.flatMap(node => node.guides.flatMap(item => item.approvedIds ?? [])))
+      const rootIds = useMemo(() => new Set(nodes.filter(node => node.root).map(node => node.id)), [nodes])
 
       function fit() {
         const box = viewport.current
@@ -314,7 +363,7 @@ window.__ModuleLoader__.load({
         if (event.key === 'Delete' || event.key === 'Backspace') {
           const id = event.target.dataset?.node
           const target = id && nodes.find(item => item.id === id)
-          if (target && !target.source) {
+          if (target && !target.root && !target.source) {
             event.preventDefault()
             remove(id)
           }
@@ -324,7 +373,7 @@ window.__ModuleLoader__.load({
         event.preventDefault()
         manual.current = true
         const id = event.target.dataset.node
-        if (id && id !== ROOT) {
+        if (id && !rootIds.has(id)) {
           const pos = positions.get(id)
           move(id, { x: pos.x + direction[0] * 16, y: pos.y + direction[1] * 16 })
           return
@@ -355,6 +404,7 @@ window.__ModuleLoader__.load({
         if (!link) return
         const at = worldPoint(event)
         const target = nodes.find(item => {
+          if (item.root) return false
           const spot = positionOf(item.id)
           return spot && at.x >= spot.x && at.x <= spot.x + CARD_W && at.y >= spot.y && at.y <= spot.y + CARD_H
         })
@@ -396,8 +446,9 @@ window.__ModuleLoader__.load({
           })),
           link && h('path', { className: 'tm-link', d: 'M' + (positionOf(link.from).x + CARD_W) + ' ' + (positionOf(link.from).y + CARD_H / 2)
             + 'L' + link.x + ' ' + link.y })),
-        [{ id: ROOT, title }, ...nodes].map((node, index) => {
-          const root = node.id === ROOT
+        nodes.map(node => {
+          const root = node.root === true
+          const index = node.order ?? 0
           const p = positionOf(node.id)
           const current = selected === node.id
           const live = !root && running && activeId === node.id
@@ -419,13 +470,13 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button', className: 'tm-card', title: node.title, 'data-node': node.id,
             'aria-pressed': current, onPointerDown: event => { if (!root) { event.stopPropagation(); start(event, node.id) } },
-            onClick: () => { if (!ignoreClick.current) select(node.id); ignoreClick.current = false },
+            onClick: () => { if (!ignoreClick.current && !root) select(node.id); ignoreClick.current = false },
             onDoubleClick: () => openGuide(node.id),
           },
           h('span', { className: 'tm-card-top' },
             h('span', { className: 'tm-kind' }, root ? icons('map', 17) :
               h('span', { className: 'tm-card-no' }, String(index).padStart(2, '0'))),
-            root ? '任务' : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
+            root ? '任务 ' + String(index).padStart(2, '0') : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
             !root && (live || node.status === 'in_progress') && h('span', { className: 'tm-live', 'aria-label': live ? '正在回答' : '进行中' }),
             !root && icons('grip', 15)),
           h('span', { className: 'tm-card-title' }, node.title),
@@ -466,14 +517,17 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (guideFocus) guideRef.current?.focus()
       }, [guideFocus])
+      const rootIds = new Set(nodes.filter(item => item.root).map(item => item.id))
       const before = ancestors(node.id, nodes)
-      const hasUpstream = [...before].some(id => id !== ROOT)
-      const eligible = nodes.filter(item => item.id !== node.id && !ancestors(item.id, nodes).has(node.id))
+      const hasUpstream = [...before].some(id => !rootIds.has(id))
+      const eligible = nodes.filter(item => !item.root && item.group === node.group && item.id !== node.id
+        && !ancestors(item.id, nodes).has(node.id))
 
       function toggleParent(id) {
-        const other = node.parents.filter(parent => parent !== ROOT)
+        const fallback = node.parents.find(parent => rootIds.has(parent)) ?? [...rootIds][0] ?? ROOT
+        const other = node.parents.filter(parent => !rootIds.has(parent))
         const parents = other.includes(id) ? other.filter(parent => parent !== id) : [...other, id]
-        update({ parents: parents.length ? parents : [ROOT] })
+        update({ parents: parents.length ? parents : [fallback] })
       }
 
       function save(event) {
@@ -542,7 +596,7 @@ window.__ModuleLoader__.load({
             node.detail && h('p', null, node.detail),
             h(Action, { className: 'tm-edit-link', text: '编辑步骤', onClick: () => setEditing(true) })),
         h('details', { className: 'tm-dependencies' },
-          h('summary', null, '前置依赖', h('span', null, node.parents.includes(ROOT) ? '任务起点' : node.parents.length + ' 个节点')),
+          h('summary', null, '前置依赖', h('span', null, node.parents.some(parent => rootIds.has(parent)) ? '任务起点' : node.parents.length + ' 个节点')),
           h('div', { className: 'tm-parent-list' }, eligible.length
             ? eligible.map(item => h('label', { key: item.id },
               h('input', { type: 'checkbox', checked: node.parents.includes(item.id), onChange: () => toggleParent(item.id) }),
@@ -574,14 +628,19 @@ window.__ModuleLoader__.load({
           h('ol', null, node.guides.map(item => h('li', { key: item.id },
             item.approval && h('strong', null, '认可上游'),
             item.text && h('p', null, item.text))))),
-        !node.source && h(Action, { className: 'tm-remove', text: '删除方块', disabled: sending, onClick: remove }))
+        !node.root && !node.source && h(Action, { className: 'tm-remove', text: '删除方块', disabled: sending, onClick: remove }))
     }
 
-    function Workbench({ sessionId, identity, todos, title, usage, running, canSend, sendPrompt, openChat }) {
+    function Workbench({ sessionId, identity, groups, title, usage, running, canSend, sendPrompt, openChat }) {
       const storageKey = 'dsh-task-map:v1:' + sessionId + ':' + identity
+      const allTodos = groups.flatMap(group => Array.isArray(group.todos) ? group.todos : [])
       const [edits, setEdits] = useState(() => readEdits(storageKey))
       const editsRef = useRef(edits)
-      const [selected, setSelected] = useState(() => todos.length ? todoId((todos.find(item => item.status === 'in_progress') ?? todos[0]).content) : ROOT)
+      const [selected, setSelected] = useState(() => {
+        const latest = groups[groups.length - 1]
+        if (!latest || !latest.todos?.length) return null
+        return todoId(latest.key, (latest.todos.find(item => item.status === 'in_progress') ?? latest.todos[0]).content)
+      })
       const [sending, setSending] = useState(false)
       const [note, setNote] = useState(null)
       const [guideFocus, setGuideFocus] = useState(null)
@@ -589,7 +648,7 @@ window.__ModuleLoader__.load({
       const [planRequested, setPlanRequested] = useState(false)
       const [active, setActive] = useState(null)
       const requestLock = useRef(false)
-      const nodes = useMemo(() => makeGraph(todos, edits), [todos, edits])
+      const nodes = useMemo(() => makeGraph(groups, edits), [groups, edits])
       const activeRef = useRef(null)
       const nodesRef = useRef(nodes)
       const wasRunning = useRef(running)
@@ -609,7 +668,7 @@ window.__ModuleLoader__.load({
       }, [running])
       const node = nodes.find(n => n.id === selected)
       const visibleSelection = node ? node.id : selected === ROOT ? ROOT : null
-      const completed = todos.filter(item => item.status === 'completed').length
+      const completed = allTodos.filter(item => item.status === 'completed').length
 
       function commit(edit) {
         const value = edit(editsRef.current)
@@ -635,9 +694,11 @@ window.__ModuleLoader__.load({
 
       function add(position) {
         const id = 'manual:' + globalThis.crypto.randomUUID()
+        const roots = nodes.filter(item => item.root)
+        const fallback = roots.length ? roots[roots.length - 1].id : ROOT
         commit(previous => ({
-          added: [...previous.added, { id, title: '新方块' }],
-          overrides: { ...previous.overrides, [id]: { parents: [ROOT], ...(position ? { position } : {}) } },
+          added: [...previous.added, { id, title: '新方块', group: roots.length ? roots[roots.length - 1].key : ROOT }],
+          overrides: { ...previous.overrides, [id]: { parents: [fallback], ...(position ? { position } : {}) } },
         }))
         setSelected(id)
         setGuideFocus({ at: globalThis.crypto.randomUUID() })
@@ -647,7 +708,7 @@ window.__ModuleLoader__.load({
         const target = nodes.find(item => item.id === to)
         if (!target || from === to) return
         if (ancestors(from, nodes).has(to)) return
-        const parents = [...target.parents.filter(parent => parent !== from && parent !== ROOT), from]
+        const parents = [...target.parents.filter(parent => parent !== from && !nodes.some(item => item.id === parent && item.root)), from]
         modify(to, { parents })
         setSelected(to)
       }
@@ -689,7 +750,7 @@ window.__ModuleLoader__.load({
           running ? 'steer' : 'queue', images)
         commit(previous => {
           const last = previous.overrides[target.id]
-          const approvedIds = approval ? [...ancestors(target.id, nodes)].filter(id => id !== ROOT) : []
+          const approvedIds = approval ? [...ancestors(target.id, nodes)].filter(id => !nodes.some(item => item.id === id && item.root)) : []
           const entry = { id: globalThis.crypto.randomUUID(), text: guide, approval, approvedIds }
           const record = { ...last, guides: [...(last?.guides ?? []), entry] }
           return { ...previous, overrides: { ...previous.overrides, [target.id]: record } }
@@ -715,7 +776,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'tm-heading-main' },
             h('span', { className: 'tm-logo' }, icons('map', 22)),
             h('div', null, h('h2', null, '任务地图', running && h('span', { className: 'tm-live', 'aria-label': '正在运行' })),
-              todos.length ? h('p', null, completed + ' / ' + todos.length) : null)),
+              allTodos.length ? h('p', null, completed + ' / ' + allTodos.length) : null)),
           h('div', { className: 'tm-heading-actions' },
             h(Usage, { usage }))),
         h('div', { className: 'tm-workbench' },
@@ -730,8 +791,8 @@ window.__ModuleLoader__.load({
           !node && h('aside', { className: 'tm-inspector tm-empty', 'aria-label': '任务概览' },
             h('div', { className: 'tm-inspector-head' }, h('span', null, '任务概览')),
             h('p', { className: 'tm-task-text' }, title),
-            !todos.length && h('h3', null, planRequested ? '已请求规划' : '等待规划'),
-            !todos.length && h(Action, { icon: 'refresh', text: sending ? '请求中…' : running ? 'DeepSeek 正在运行' : '请求规划',
+            !allTodos.length && h('h3', null, planRequested ? '已请求规划' : '等待规划'),
+            !allTodos.length && h(Action, { icon: 'refresh', text: sending ? '请求中…' : running ? 'DeepSeek 正在运行' : '请求规划',
               className: 'tm-primary', disabled: sending || running || !canSend, onClick: requestPlan }),
             requestError && h('p', { className: 'tm-error', role: 'alert' }, requestError),
             h(Action, { className: 'tm-back', text: '返回对话', onClick: openChat }))))
@@ -745,13 +806,19 @@ window.__ModuleLoader__.load({
       const running = useSession(s => s.running)
       const sessionReady = useSession(s => s.openState === 'open' && !s.removed && !s.subagent)
       const canSend = useAccess('session/prompt') !== false && sessionReady
-      const current = projection.task ?? projection.plan
-      const plan = projection.plan?.key === current?.key ? projection.plan : null
-      const identity = current?.key ?? 'conversation'
-      const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : plan?.todos ?? EMPTY_TODOS
+      const missions = Array.isArray(projection.missions) ? projection.missions : []
+      const groups = missions
+        .filter(mission => Array.isArray(mission.todos) && mission.todos.length)
+        .map(mission => ({ key: mission.key, title: mission.title }))
+      if (!groups.length) {
+        const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : projection.plan?.todos ?? EMPTY_TODOS
+        if (todos.length) groups.push({ key: projection.plan?.key ?? 'current', title: projection.task?.title ?? projection.plan?.title ?? '' })
+      }
+      const latest = missions[missions.length - 1]
+      const title = latest?.title || projection.task?.title || projection.plan?.title
       return h(Workbench, {
-        key: sessionId + ':' + identity, sessionId, identity,
-        todos, title: current?.title || (typeof sessionTitle === 'string' ? sessionTitle : '') || '当前会话任务',
+        key: sessionId + ':history', sessionId, identity: 'history',
+        groups, title: title || (typeof sessionTitle === 'string' ? sessionTitle : '') || '当前会话任务',
         usage, running, canSend,
         sendPrompt, openChat: () => openView('chat', ''),
       })
