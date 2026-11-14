@@ -1,0 +1,7 @@
+{
+  "name": "Task map",
+  "meta": {
+    "title": "Task map",
+    "description": "View this session’s DeepSeek plan as a map, edit steps and dependencies, send node guides, and inspect session token usage."
+  }
+}

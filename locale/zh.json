@@ -1,0 +1,7 @@
+{
+  "name": "任务地图",
+  "meta": {
+    "title": "任务地图",
+    "description": "在当前会话查看 DeepSeek 待办的节点地图，编辑步骤与依赖，发送节点 Guide 并查看会话 token 用量。"
+  }
+}

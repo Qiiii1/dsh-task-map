@@ -1,0 +1,28 @@
+{
+  "name": "dsh-task-map",
+  "version": "0.1.0",
+  "description": "Editable session plan and node guides for DeepSeek Harness",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/Qiiii1/dsh-task-map.git" },
+  "homepage": "https://github.com/Qiiii1/dsh-task-map#readme",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./dist/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "src/plan.js", "dist/client.js", "locale", "icon.svg", "cordis.patch.yml"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-session"]
+    }
+  }
+}
