@@ -12,9 +12,13 @@ function validTodos(todos) {
     && ['pending', 'in_progress', 'completed'].includes(item.status))
 }
 
+function validRefs(refs) {
+  return refs === undefined || (Array.isArray(refs) && refs.every(ref => typeof ref?.kind === 'string' && typeof ref.text === 'string'))
+}
+
 function validMission(mission) {
   return typeof mission?.key === 'string' && typeof mission.title === 'string'
-    && (mission.todos === null || validTodos(mission.todos))
+    && (mission.todos === null || validTodos(mission.todos)) && validRefs(mission.refs)
 }
 
 const schema = {

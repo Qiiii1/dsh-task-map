@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
       refresh: 'M20 7v5h-5M4 17v-5h5M20 12a8 8 0 0 0-14-5m-2 5a8 8 0 0 0 14 5',
       square: 'M4 4h16v16H4zM9 9h6v6H9z',
       image: 'M4 5h16v14H4zM4 15l4.5-4.5 3.5 3.5 3-3L20 15M15.5 9.5h.01',
+      target: 'M12 3v3.2m0 11.6V21M3 12h3.2m11.6 0H21M12 8.4a3.6 3.6 0 1 0 0 7.2 3.6 3.6 0 0 0 0-7.2Z',
     }
     const icons = (name, size = 16) => h('svg', {
       viewBox: '0 0 24 24', width: size, height: size, 'aria-hidden': true,
@@ -45,6 +46,21 @@ window.__ModuleLoader__.load({
     const statusIcons = { pending: 'pending', in_progress: 'active', completed: 'check' }
     const EMPTY_PLAN = { task: null, plan: null }
     const EMPTY_TODOS = []
+    function missionEdges(groups) {
+      const edges = []
+      groups.forEach((group, index) => {
+        const words = (group.refs ?? []).some(ref => ref.kind === 'word')
+        for (let back = index - 1; back >= 0; back--) {
+          const previous = groups[back].refs ?? []
+          const hits = (group.refs ?? []).filter(ref => previous.some(other => other.text.toLowerCase() === ref.text.toLowerCase()))
+          if (hits.length || (words && back === index - 1)) {
+            edges.push({ from: groups[back].key, to: group.key, back, index, hits })
+            break
+          }
+        }
+      })
+      return edges
+    }
 
     function Action({ icon, label, text, className = '', ...props }) {
       return h('button', {
@@ -70,7 +86,7 @@ window.__ModuleLoader__.load({
           h('small', { className: 'tm-build' }, 'build ' + buildStamp)))
     }
 
-    function Canvas({ nodes, title, selected, select, add, connect, move, remove, onBlank, openGuide, running, activeId }) {
+    function Canvas({ nodes, title, selected, select, add, connect, move, remove, onBlank, openGuide, running, activeId, edges = [], currentKey, focus, setFocus }) {
       const viewport = useRef(null)
       const gesture = useRef(null)
       const ignoreClick = useRef(false)
@@ -78,8 +94,10 @@ window.__ModuleLoader__.load({
       const manual = useRef(false)
       const [view, setView] = useState({ x: 30, y: 100, zoom: 0.8 })
       const [drag, setDrag] = useState(null)
+      const [push, setPush] = useState(null)
       const [link, setLink] = useState(null)
-      const positions = useMemo(() => layout(nodes), [nodes])
+      const visible = useMemo(() => focus ? focusOnly(nodes, focus) : nodes, [nodes, focus])
+      const positions = useMemo(() => focus ? focusLayout(visible, focus) : layout(visible), [visible, focus])
       const bounds = useMemo(() => {
         const points = [...positions.values()]
         if (!points.length) return { left: 0, top: 0, right: CARD_W, bottom: CARD_H }
@@ -95,25 +113,48 @@ window.__ModuleLoader__.load({
       const approved = new Set(nodes.flatMap(node => node.guides.flatMap(item => item.approvedIds ?? [])))
       const rootIds = useMemo(() => new Set(nodes.filter(node => node.root).map(node => node.id)), [nodes])
 
-      function fit() {
+      function fit(minZoom = 0.15) {
         const box = viewport.current
         if (!box) return
         const width = bounds.right - bounds.left
         const height = bounds.bottom - bounds.top
         const factor = (box.clientWidth - 80) / width
-        const zoom = Math.min(1, Math.max(0.15, Math.min(factor, (box.clientHeight - 130) / height)))
+        const zoom = Math.min(1, Math.max(minZoom, Math.min(factor, (box.clientHeight - 130) / height)))
         setView({
           zoom,
           x: Math.max(28, (box.clientWidth - width * zoom) / 2) - bounds.left * zoom,
           y: Math.max(46, (box.clientHeight - height * zoom) / 2 - 12) - bounds.top * zoom,
         })
       }
+      function focusMission(key) {
+        const spot = positions.get('root:' + key)
+        const box = viewport.current
+        if (!spot || !box) return
+        setView(current => ({
+          ...current,
+          x: box.clientWidth / 2 - (spot.x + CARD_W / 2) * current.zoom,
+          y: box.clientHeight / 2 - (spot.y + CARD_H / 2) * current.zoom,
+        }))
+      }
       useLayoutEffect(() => {
-        if (!manual.current) fit()
+        if (!manual.current) fit(visible.filter(node => node.root).length === 1 ? 0.75 : 0.15)
         const watcher = new ResizeObserver(() => { if (!manual.current) fit() })
         watcher.observe(viewport.current)
         return () => watcher.disconnect()
       }, [bounds])
+
+      function locate() {
+        const cards = nodes.filter(node => !node.root)
+        const target = (running && cards.find(node => node.id === activeId))
+          || [...cards].reverse().find(node => node.status === 'in_progress')
+          || [...cards].reverse()[0]
+        const box = viewport.current
+        if (!target || !box) return
+        manual.current = true
+        select(target.id)
+        setFocus(target.id)
+        setView({ zoom: 1, x: box.clientWidth / 2, y: box.clientHeight / 2 })
+      }
 
       function zoomBy(factor, clientX, clientY) {
         const box = viewport.current.getBoundingClientRect()
@@ -171,8 +212,10 @@ window.__ModuleLoader__.load({
           viewport.current.setPointerCapture(event.pointerId)
         }
         const position = point(event, current)
-        if (current.id) setDrag({ id: current.id, position })
-        else setView(value => ({ ...value, ...position }))
+        if (current.id) {
+          setDrag({ id: current.id, position })
+          setPush(repel(current.id, position))
+        } else setView(value => ({ ...value, ...position }))
       }
 
       function release(event, cancelled = false) {
@@ -181,7 +224,11 @@ window.__ModuleLoader__.load({
         gesture.current = null
         ignoreClick.current = current.moved
         setDrag(null)
-        if (!cancelled && current.id && current.moved) move(current.id, point(event, current))
+        setPush(null)
+        if (!cancelled && current.id && current.moved) {
+          move(current.id, point(event, current))
+          if (push) for (const [id, position] of push) move(id, position)
+        }
         if (!cancelled && !current.id && !current.moved && !event.target.closest('button')) onBlank()
       }
 
@@ -208,7 +255,33 @@ window.__ModuleLoader__.load({
         }
         setView(v => ({ ...v, x: v.x - direction[0] * 64, y: v.y - direction[1] * 64 }))
       }
-      const positionOf = id => drag?.id === id ? drag.position : positions.get(id)
+      const positionOf = id => drag?.id === id ? drag.position : (push?.get(id) ?? positions.get(id))
+      // 拖一张卡经过别人时，把挡路的卡沿最短方向实时推开（等价 topic-explorer 的 repelCards 阻尼推挤）。
+      function repel(draggedId, spot) {
+        const place = new Map()
+        for (const [id, position] of positions) if (id !== draggedId) place.set(id, { ...position })
+        const gap = 18
+        for (let round = 0; round < 4; round++) {
+          let moved = false
+          for (const position of place.values()) {
+            const dx = (position.x + CARD_W / 2) - (spot.x + CARD_W / 2)
+            const dy = (position.y + CARD_H / 2) - (spot.y + CARD_H / 2)
+            const overlapX = CARD_W + gap - Math.abs(dx)
+            const overlapY = CARD_H + gap - Math.abs(dy)
+            if (overlapX <= 0 || overlapY <= 0) continue
+            moved = true
+            if (overlapX < overlapY) position.x += (dx > 0 ? 1 : -1) * overlapX
+            else position.y += (dy > 0 ? 1 : -1) * overlapY
+          }
+          if (!moved) break
+        }
+        const result = new Map()
+        for (const [id, position] of place) {
+          const base = positions.get(id)
+          if (Math.abs(position.x - base.x) > 0.5 || Math.abs(position.y - base.y) > 0.5) result.set(id, position)
+        }
+        return result.size ? result : null
+      }
       function worldPoint(event) {
         const box = viewport.current.getBoundingClientRect()
         return {
@@ -255,34 +328,75 @@ window.__ModuleLoader__.load({
       },
       h('div', { className: 'tm-world', style: { transform: 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.zoom + ')' } },
         h('svg', { className: 'tm-edges', 'aria-hidden': true },
-          nodes.flatMap(node => node.parents.map(parent => {
+          visible.flatMap(node => node.parents.map(parent => {
             const a = positionOf(parent), b = positionOf(node.id)
-            const vertical = Math.abs(a.x - b.x) < CARD_W * 0.65
-            const direction = vertical ? Math.sign(b.y - a.y) || 1 : Math.sign(b.x - a.x)
-            const x1 = a.x + (vertical ? CARD_W / 2 : direction > 0 ? CARD_W : 0)
-            const x2 = b.x + (vertical ? CARD_W / 2 : direction > 0 ? 0 : CARD_W)
-            const y1 = a.y + (vertical ? direction > 0 ? CARD_H : 0 : CARD_H / 2)
-            const y2 = b.y + (vertical ? direction > 0 ? 0 : CARD_H : CARD_H / 2)
-            const curve = direction * Math.max(32, Math.abs(vertical ? y2 - y1 : x2 - x1) * 0.42)
+            const ax = a.x + CARD_W / 2, ay = a.y + CARD_H / 2
+            const bx = b.x + CARD_W / 2, by = b.y + CARD_H / 2
+            const dx = bx - ax, dy = by - ay
+            const length = Math.hypot(dx, dy) || 1
+            const ux = dx / length, uy = dy / length
+            const reach = Math.min(CARD_W / 2 / Math.max(Math.abs(ux), 0.0001), CARD_H / 2 / Math.max(Math.abs(uy), 0.0001))
+            const x1 = ax + ux * reach, y1 = ay + uy * reach
+            const x2 = bx - ux * reach, y2 = by - uy * reach
+            const span = Math.max(1, length - reach * 2)
+            const bow = Math.min(64, span * 0.16)
+            const nx = -uy, ny = ux
+            const c1x = x1 + (x2 - x1) * 0.35 + nx * bow, c1y = y1 + (y2 - y1) * 0.35 + ny * bow
+            const c2x = x1 + (x2 - x1) * 0.65 + nx * bow, c2y = y1 + (y2 - y1) * 0.65 + ny * bow
             const active = selected && upper.has(parent) && (upper.has(node.id) || node.id === selected)
               || selected === parent
-            const path = vertical
-              ? 'M' + x1 + ' ' + y1 + 'C' + x1 + ' ' + (y1 + curve) + ' ' + x2 + ' ' + (y2 - curve) + ' ' + x2 + ' ' + y2
-              : 'M' + x1 + ' ' + y1 + 'C' + (x1 + curve) + ' ' + y1 + ' ' + (x2 - curve) + ' ' + y2 + ' ' + x2 + ' ' + y2
+            const path = 'M' + x1 + ' ' + y1 + 'C' + c1x + ' ' + c1y + ' ' + c2x + ' ' + c2y + ' ' + x2 + ' ' + y2
+            const angle = Math.atan2(uy, ux) * 180 / Math.PI
             return h('g', { key: JSON.stringify([parent, node.id]), 'data-path': active ? 'active' : undefined },
-              h('path', { d: path }), h('circle', { cx: x2, cy: y2, r: 3.6 }))
+              h('path', { d: path }),
+              h('path', { className: 'tm-arrow', d: 'M-7 -3.6 L0 0 L-7 3.6', transform: 'translate(' + x2 + ' ' + y2 + ') rotate(' + angle + ')' }))
           })),
+          edges.map(edge => {
+            const from = positions.get('root:' + edge.from), to = positions.get('root:' + edge.to)
+            if (!from || !to) return null
+            const x1 = from.x + CARD_W / 2, y1 = from.y + CARD_H
+            const x2 = to.x + CARD_W / 2, y2 = to.y
+            const bulge = Math.max(36, Math.abs(y2 - y1) * 0.42)
+            const label = '任务 ' + String(edge.back + 1).padStart(2, '0') + ' → 任务 ' + String(edge.index + 1).padStart(2, '0')
+              + (edge.hits.length ? '\n共同引用：' + edge.hits.map(ref => ref.text).join('、') : '\n承接上一段')
+            return h('path', {
+              key: 'ref-' + edge.from + '-' + edge.to, className: 'tm-mission-link',
+              d: 'M' + x1 + ' ' + y1 + 'C' + (x1 + bulge) + ' ' + y1 + ' ' + (x2 + bulge) + ' ' + y2 + ' ' + x2 + ' ' + y2,
+            }, h('title', null, label))
+          }),
+          visible.filter(node => node.root).map((root, at, list) => {
+            const next = list[at + 1]
+            if (!next) return null
+            const from = positions.get(root.id)
+            const to = positions.get(next.id)
+            if (!from || !to) return null
+            let bottom = from.y + CARD_H
+            for (const node of visible) {
+              if (node.root || node.group !== root.group) continue
+              const spot = positions.get(node.id)
+              if (spot) bottom = Math.max(bottom, spot.y + CARD_H)
+            }
+            const x = from.x + CARD_W / 2
+            const y1 = bottom + 12
+            const y2 = to.y - 14
+            if (y2 <= y1) return null
+            return h('g', { key: 'band-' + root.key + '-' + next.key },
+              h('path', { className: 'tm-band-link', d: 'M' + x + ' ' + y1 + 'L' + x + ' ' + (y2 - 7) }),
+              h('path', { className: 'tm-band-link', d: 'M-5.5 -7 L0 0 L5.5 -7', transform: 'translate(' + x + ' ' + y2 + ')' }))
+          }),
           link && h('path', { className: 'tm-link', d: 'M' + (positionOf(link.from).x + CARD_W) + ' ' + (positionOf(link.from).y + CARD_H / 2)
             + 'L' + link.x + ' ' + link.y })),
-        nodes.map(node => {
+        visible.map(node => {
           const root = node.root === true
           const index = node.order ?? 0
           const p = positionOf(node.id)
           const current = selected === node.id
           const live = !root && running && activeId === node.id
           return h('div', { className: 'tm-node', key: node.id, style: { left: p.x, top: p.y },
-            'data-root': root || undefined, 'data-status': node.status, 'data-live': live || undefined,
+            'data-root': root || undefined, 'data-current': root && node.key === currentKey || undefined,
+            'data-status': node.status, 'data-live': live || undefined,
             'data-selected': current || undefined,
+            'data-dragging': drag?.id === node.id || undefined,
             'data-muted': !root && selected && !focusPath.has(node.id) || undefined },
           !root && h('span', {
             className: 'tm-port', role: 'button', title: '拖到另一个方块，建立连接',
@@ -304,7 +418,8 @@ window.__ModuleLoader__.load({
           h('span', { className: 'tm-card-top' },
             h('span', { className: 'tm-kind' }, root ? icons('map', 17) :
               h('span', { className: 'tm-card-no' }, String(index).padStart(2, '0'))),
-            root ? '任务 ' + String(index).padStart(2, '0') : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
+            root ? '任务 ' + String(index).padStart(2, '0') + (node.key === currentKey ? ' · 当前' : '')
+              : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
             !root && (live || node.status === 'in_progress') && h('span', { className: 'tm-live', 'aria-label': live ? '正在回答' : '进行中' }),
             !root && icons('grip', 15)),
           h('span', { className: 'tm-card-title' }, node.title),
@@ -312,7 +427,14 @@ window.__ModuleLoader__.load({
             icons(approved.has(node.id) ? 'check' : node.guides.length ? 'guide' : statusIcons[node.status], 14),
             approved.has(node.id) && h('span', null, '已认可'),
             approved.has(node.id) && node.guides.length > 0 && h('span', null, '·'),
-            node.guides.length ? node.guides.length + ' 条 Guide' : null)))
+            node.guides.length ? node.guides.length + ' 条 Guide' : null)),
+          root && edges.some(edge => edge.to === node.key) && h('div', { className: 'tm-ref-row' },
+            edges.filter(edge => edge.to === node.key).map(edge => h('span', {
+              key: 'ref-' + edge.from, className: 'tm-ref-chip', role: 'button', tabIndex: 0,
+              title: edge.hits.length ? '共同引用：' + edge.hits.map(ref => ref.text).join('、') : '承接上一段',
+              onPointerDown: event => event.stopPropagation(),
+              onClick: event => { event.stopPropagation(); focusMission(edge.from) },
+            }, '↩ 任务 ' + String(edge.back + 1).padStart(2, '0')))))
         })),
       h('div', { className: 'tm-dock', 'aria-label': '画布工具' },
         h(Action, { icon: 'minus', label: '缩小', onClick: () => zoomBy(1 / 1.2) }),
@@ -328,7 +450,13 @@ window.__ModuleLoader__.load({
           }),
         }, icons('square', 18)),
         h('span', { className: 'tm-dock-divider' }),
-        h(Action, { icon: 'fit', label: '适配画布', onClick: () => { manual.current = false; fit() } })))
+        h('button', {
+          type: 'button', className: 'tm-locate', title: '居中到进行中的卡片，并把相关卡片排到周围',
+          'aria-label': '居中到进行中的卡片', 'data-active': focus ? true : undefined,
+          onClick: locate,
+        }, icons('target', 18)),
+        focus && h('span', { className: 'tm-focus', title: '聚焦相关卡片，点「适配画布」返回全图' }, '聚焦'),
+        h(Action, { icon: 'fit', label: '适配画布', onClick: () => { setFocus(null); manual.current = false; fit() } })))
     }
 
     function Inspector({ node, nodes, close, update, remove, sending, canSend, running, send, notification, guideFocus, autoComplete, onAutoComplete }) {
@@ -461,7 +589,10 @@ window.__ModuleLoader__.load({
 
     function Workbench({ sessionId, identity, groups, title, usage, running, canSend, sendPrompt, openChat }) {
       const storageKey = 'dsh-task-map:v1:' + sessionId + ':' + identity
-      const allTodos = groups.flatMap(group => Array.isArray(group.todos) ? group.todos : [])
+      const [scope, setScope] = useState(() => (readEdits(storageKey).scope === 'all' ? 'all' : 'current'))
+      const [focus, setFocus] = useState(null)
+      const shown = scope === 'all' || groups.length < 2 ? groups : groups.slice(-1)
+      const allTodos = shown.flatMap(group => Array.isArray(group.todos) ? group.todos : [])
       const [edits, setEdits] = useState(() => readEdits(storageKey))
       const editsRef = useRef(edits)
       const [selected, setSelected] = useState(() => {
@@ -476,7 +607,8 @@ window.__ModuleLoader__.load({
       const [planRequested, setPlanRequested] = useState(false)
       const [active, setActive] = useState(null)
       const requestLock = useRef(false)
-      const nodes = useMemo(() => makeGraph(groups, edits), [groups, edits])
+      const nodes = useMemo(() => makeGraph(shown, edits), [shown, edits])
+      const edges = useMemo(() => missionEdges(shown), [shown])
       const activeRef = useRef(null)
       const nodesRef = useRef(nodes)
       const wasRunning = useRef(running)
@@ -485,14 +617,19 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const ended = wasRunning.current && !running
         wasRunning.current = running
-        if (!ended) return
-        const id = activeRef.current?.id
-        const target = id ? nodesRef.current.find(item => item.id === id) : null
-        if (!target || target.status === 'completed' || editsRef.current.autoComplete === false) return
-        commit(previous => ({
-          ...previous,
-          overrides: { ...previous.overrides, [id]: { ...previous.overrides[id], status: 'completed', autoDone: true } },
-        }))
+        if (!ended || editsRef.current.autoComplete === false) return
+        const current = shown[shown.length - 1]?.key
+        const ids = new Set()
+        for (const item of nodesRef.current) {
+          if (item.root || item.status === 'completed') continue
+          if (item.id === activeRef.current?.id || item.group === current && item.status === 'in_progress') ids.add(item.id)
+        }
+        if (!ids.size) return
+        commit(previous => {
+          const overrides = { ...previous.overrides }
+          for (const id of ids) overrides[id] = { ...overrides[id], status: 'completed', autoDone: true }
+          return { ...previous, overrides }
+        })
       }, [running])
       const node = nodes.find(n => n.id === selected)
       const visibleSelection = node ? node.id : selected === ROOT ? ROOT : null
@@ -606,10 +743,16 @@ window.__ModuleLoader__.load({
             h('div', null, h('h2', null, '任务地图', running && h('span', { className: 'tm-live', 'aria-label': '正在运行' })),
               allTodos.length ? h('p', null, completed + ' / ' + allTodos.length) : null)),
           h('div', { className: 'tm-heading-actions' },
+            groups.length > 1 && h('div', { className: 'tm-scope', role: 'group', 'aria-label': '显示范围' },
+              h('button', { type: 'button', className: 'tm-scope-button', 'data-active': scope !== 'all' || undefined,
+                onClick: () => { setFocus(null); setScope('current'); commit(previous => ({ ...previous, scope: 'current' })) } }, '当前'),
+              h('button', { type: 'button', className: 'tm-scope-button', 'data-active': scope === 'all' || undefined,
+                onClick: () => { setFocus(null); setScope('all'); commit(previous => ({ ...previous, scope: 'all' })) } }, '全部')),
             h(Usage, { usage }))),
         h('div', { className: 'tm-workbench' },
-          h(Canvas, { nodes, title, selected: visibleSelection, select: choose, add, connect, remove, openGuide,
-            running, activeId: active?.id,
+          h(Canvas, { key: 'canvas-' + scope, nodes, title, selected: visibleSelection, select: choose, add, connect, remove, openGuide, edges,
+            currentKey: shown.length ? shown[shown.length - 1].key : undefined,
+            running, activeId: active?.id, focus, setFocus,
             move: (id, position) => modify(id, { position }), onBlank: () => choose(null) }),
           node && h(Inspector, { key: node.id, node, nodes, running, sending, canSend, guideFocus,
             autoComplete: edits.autoComplete !== false,
@@ -637,10 +780,14 @@ window.__ModuleLoader__.load({
       const missions = Array.isArray(projection.missions) ? projection.missions : []
       const groups = missions
         .filter(mission => Array.isArray(mission.todos) && mission.todos.length)
-        .map(mission => ({ key: mission.key, title: mission.title }))
+        .map((mission, at, list) => ({
+          key: mission.key, title: mission.title, refs: mission.refs ?? [],
+          todos: at === list.length - 1 ? mission.todos
+            : mission.todos.map(todo => todo.status === 'in_progress' ? { ...todo, status: 'pending' } : todo),
+        }))
       if (!groups.length) {
         const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : projection.plan?.todos ?? EMPTY_TODOS
-        if (todos.length) groups.push({ key: projection.plan?.key ?? 'current', title: projection.task?.title ?? projection.plan?.title ?? '' })
+        if (todos.length) groups.push({ key: projection.plan?.key ?? 'current', title: projection.task?.title ?? projection.plan?.title ?? '', todos, refs: [] })
       }
       const latest = missions[missions.length - 1]
       const title = latest?.title || projection.task?.title || projection.plan?.title

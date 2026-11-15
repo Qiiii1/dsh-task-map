@@ -1,4 +1,27 @@
 const MAX_MISSIONS = 12
+const WORD_REF = /继续|接着|刚才|之前|上一步|上一段|前面|上面|沿用/gu
+
+// 从用户消息里抽「可能是上下文引用」的线索：文件路径、引号引用、承接词。
+function readRefs(text) {
+  const refs = []
+  const push = (kind, value) => {
+    const clean = value.trim().replace(/[，。；、：；,.)）]+$/u, '')
+    if (clean.length < 2 || clean.length > 80) return
+    if (refs.length >= 10 || refs.some(ref => ref.text.toLowerCase() === clean.toLowerCase())) return
+    refs.push({ kind, text: clean })
+  }
+  for (const match of text.matchAll(/(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]*(?:\.[A-Za-z0-9]{1,8})?/gu)) push('path', match[0])
+  for (const match of text.matchAll(/[A-Za-z0-9_-]+\.(?:js|mjs|cjs|ts|tsx|jsx|css|html|json|md|markdown|py|yml|yaml|sh|toml|svg|png)\b/giu)) push('path', match[0])
+  for (const match of text.matchAll(/「([^」]{2,60})」/gu)) push('quote', match[1])
+  for (let index = refs.length - 1; index >= 0; index--) {
+    const ref = refs[index]
+    if (ref.kind !== 'path' || !refs.some(other => other !== ref && other.kind === 'path' && other.text.endsWith('/' + ref.text))) continue
+    refs.splice(index, 1)
+  }
+  for (const match of text.matchAll(/“([^”]{2,60})”/gu)) push('quote', match[1])
+  for (const match of text.matchAll(WORD_REF)) push('word', match[0])
+  return refs
+}
 
 function readMissions(state) {
   if (Array.isArray(state.missions)) return state.missions
@@ -17,7 +40,7 @@ export function projectPlan(state, event) {
     const text = event.data.content.filter(block => block.type === 'text').map(block => block.text).join(' ').trim()
     if (text.startsWith('【任务地图 Guide】') || text.startsWith('【任务地图 规划】')) return state
     const title = Array.from(text.replace(/\s+/g, ' ')).slice(0, 140).join('')
-    const mission = { key: 'user-' + event.seq, title, todos: null }
+    const mission = { key: 'user-' + event.seq, title, todos: null, refs: readRefs(text) }
     return { ...state, task: { key: mission.key, title }, missions: [...missions, mission].slice(-MAX_MISSIONS) }
   }
   if (event.type === 'todo/write') {

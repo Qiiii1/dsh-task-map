@@ -7,6 +7,12 @@ window.__ModuleLoader__.load({
     const GAP_X = 88
     const GAP_Y = 42
     const GROUP_GAP = 96
+    const PER_ROW = 3
+    const STEP_X = CARD_W + 84
+    const STEP_Y = CARD_H + 84
+    const BLOCK_Y = CARD_H + 52
+    const BLOCK_STEP = CARD_H + 36
+    const BAND_GAP = 92
     const ROOT = 'task'
     const EMPTY_EDITS = { overrides: {}, added: [] }
 
@@ -87,54 +93,156 @@ window.__ModuleLoader__.load({
       return items
     }
 
-    function layout(items) {
-      const positions = new Map()
-      const roots = items.filter(item => item.root)
-      let yOffset = 0
-      for (const root of roots) {
-        const group = items.filter(item => !item.root && item.group === root.group)
-        const lookup = new Map([[root.id, root], ...group.map(item => [item.id, item])])
-        const levels = new Map([[root.id, 0]])
-        const level = id => {
-          if (!levels.has(id)) {
-            const parents = lookup.get(id)?.parents.filter(parent => lookup.has(parent)) ?? []
-            levels.set(id, parents.length ? 1 + Math.max(...parents.map(level)) : 1)
-          }
-          return levels.get(id)
-        }
-        const columns = new Map()
-        positions.set(root.id, { x: 0, y: yOffset })
-        for (const item of group) {
-          const column = level(item.id)
-          if (!columns.has(column)) columns.set(column, [])
-          columns.get(column).push(item)
-        }
-        // Fold long plans across the canvas so early and late steps are visible
-        // together. Within one depth, nodes sit in parallel.
-        const last = Math.max(0, ...columns.keys())
-        const columnsPerRow = 3
-        let rowY = 0
-        for (let first = 0; first <= last; first += columnsPerRow) {
-          const row = first / columnsPerRow
-          const count = Math.min(columnsPerRow, last - first + 1)
-          let height = CARD_H
-          for (let offset = 0; offset < count; offset++) {
-            const column = first + offset
-            const bucket = columns.get(column) ?? []
-            const columnX = row % 2 === 0 ? offset : columnsPerRow - 1 - offset
-            height = Math.max(height, bucket.length * (CARD_H + GAP_Y) - GAP_Y)
-            bucket.forEach((item, index) => positions.set(item.id, item.position ?? {
-              x: columnX * (CARD_W + GAP_X),
-              y: yOffset + rowY + index * (CARD_H + GAP_Y),
-            }))
-          }
-          rowY += height + 100
-        }
-        yOffset += rowY + GROUP_GAP
+    // 布局参考 topic-explorer 的主线树状：起点卡片作为流程起点，步骤按深度从左到右推进；
+    // 一行放不下时蛇形折行（下一行从右往左接），行尾与下一行首之间是垂直连线，阅读顺序不会断。
+    // 手动方块挂在其目标步骤的正下方，不占主流程的位置。
+    function bandOf(root, items) {
+      const group = items.filter(item => !item.root && item.group === root.group)
+      const sources = group.filter(item => item.source).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      const blocks = group.filter(item => !item.source)
+      const index = new Map(sources.map((item, at) => [item.id, at]))
+      const rowOf = id => Math.floor((index.get(id) ?? 0) / PER_ROW)
+      const rows = Math.max(1, Math.ceil(sources.length / PER_ROW))
+      const placed = []
+      const depthOf = new Map()
+      for (const block of blocks) {
+        const parent = block.parents.find(id => index.has(id))
+        const row = parent ? rowOf(parent) : rows - 1
+        const key = parent ?? 'loose:' + row
+        const depth = depthOf.get(key) ?? 0
+        depthOf.set(key, depth + 1)
+        placed.push({ block, parent, row, depth })
       }
+      const perRowDepth = new Map()
+      for (const entry of placed) perRowDepth.set(entry.row, Math.max(perRowDepth.get(entry.row) ?? 0, entry.depth + 1))
+      const rowTops = []
+      let top = 0
+      for (let row = 0; row < rows; row++) {
+        rowTops[row] = top
+        const stacked = perRowDepth.get(row) ?? 0
+        top += stacked
+          ? Math.max(STEP_Y, BLOCK_Y + (stacked - 1) * BLOCK_STEP + CARD_H + 52)
+          : STEP_Y
+      }
+      const spots = new Map([[root.id, { x: 0, y: rowTops[0] }]])
+      sources.forEach((item, at) => {
+        const row = Math.floor(at / PER_ROW)
+        const slot = at % PER_ROW
+        const column = row % 2 === 0 ? slot : PER_ROW - 1 - slot
+        spots.set(item.id, { x: STEP_X + column * STEP_X, y: rowTops[row] })
+      })
+      for (const entry of placed) {
+        if (entry.block.position) continue
+        const parent = entry.parent ? spots.get(entry.parent) : null
+        const baseX = parent ? parent.x : STEP_X + (PER_ROW - 1) * STEP_X
+        const baseY = (parent ? parent.y : rowTops[entry.row]) + BLOCK_Y + entry.depth * BLOCK_STEP
+        spots.set(entry.block.id, { x: baseX, y: baseY })
+      }
+      let width = 0
+      let height = 0
+      for (const spot of spots.values()) {
+        width = Math.max(width, spot.x + CARD_W)
+        height = Math.max(height, spot.y + CARD_H)
+      }
+      return { spots, width, height }
+    }
+
+    const FOCUS_RING = 224
+    const FOCUS_RING_STEP = 156
+    const FOCUS_GAP = 14
+
+    // 聚焦布局：把目标卡片放在正中，按依赖距离一圈圈往外散开。
+    // 上游在左、下游在右、手动方块在下方，其它任务的起点卡排在最外圈。
+    function focusLayout(items, centerId) {
+      const center = items.find(item => item.id === centerId)
+      if (!center) return layout(items)
+      const byId = new Map(items.map(item => [item.id, item]))
+      const related = (a, b) => {
+        const left = byId.get(a)
+        const right = byId.get(b)
+        if (!left || !right) return false
+        return left.parents.includes(right.id) || right.parents.includes(left.id)
+      }
+      const level = new Map([[center.id, 0]])
+      let frontier = [center]
+      while (frontier.length) {
+        const next = []
+        for (const node of frontier) {
+          for (const other of items) {
+            if (level.has(other.id) || other.group !== center.group) continue
+            if (!related(node.id, other.id)) continue
+            level.set(other.id, level.get(node.id) + 1)
+            next.push(other)
+          }
+        }
+        frontier = next
+      }
+      const up = ancestors(center.id, items)
+      const preferred = node => {
+        if (up.has(node.id)) return Math.PI
+        if (!node.root && !node.source) return Math.PI / 2
+        return 0
+      }
+      const positions = new Map([[center.id, { x: -CARD_W / 2, y: -CARD_H / 2 }]])
+      function free(x, y) {
+        for (const other of positions.values()) {
+          if (Math.abs(x - other.x) < CARD_W + FOCUS_GAP && Math.abs(y - other.y) < CARD_H + FOCUS_GAP) return false
+        }
+        return true
+      }
+      function place(id, ring, angle) {
+        for (let attempt = 0; attempt < 6; attempt++) {
+          const level = ring + attempt
+          const slots = 6 * level
+          const radius = FOCUS_RING + (level - 1) * FOCUS_RING_STEP
+          const order = []
+          for (let s = 0; s < slots; s++) {
+            const slotAngle = (2 * Math.PI * s) / slots
+            order.push({ s, gap: Math.abs(((slotAngle - angle + Math.PI * 3) % (Math.PI * 2)) - Math.PI) })
+          }
+          order.sort((a, b) => a.gap - b.gap)
+          for (const entry of order) {
+            const theta = (2 * Math.PI * entry.s) / slots
+            const x = radius * Math.cos(theta) - CARD_W / 2
+            const y = radius * Math.sin(theta) - CARD_H / 2
+            if (!free(x, y)) continue
+            positions.set(id, { x, y })
+            return
+          }
+        }
+      }
+      const inside = items
+        .filter(item => item.group === center.group && item.id !== center.id)
+        .sort((a, b) => (level.get(a.id) ?? 99) - (level.get(b.id) ?? 99))
+      for (const node of inside) place(node.id, level.get(node.id) ?? 1, preferred(node))
+      const outsiders = items.filter(item => item.root && item.group !== center.group)
+      const ring = Math.min(3, Math.max(1, ...level.values()) + 1)
+      outsiders.forEach((node, at) => place(node.id, ring, (2 * Math.PI * at) / Math.max(1, outsiders.length)))
+      for (const item of items) if (item.position && !positions.has(item.id)) positions.set(item.id, item.position)
+      return positions
+    }
+
+    function focusOnly(items, id) {
+      const node = items.find(item => item.id === id)
+      if (!node) return items
+      return items.filter(item => item.group === node.group || item.root)
+    }
+
+    // 每段任务是一条自左向右推进的主线（一行放不下就蛇形折行），多段任务按时间顺序
+    // 自上而下堆叠、共用同一个左边界，段与段之间由画布上的纵向虚线箭头串起来。
+    function layout(items) {
+      const bands = items.filter(item => item.root).map(root => bandOf(root, items))
+      const positions = new Map()
+      let cursor = 0
+      for (const band of bands) {
+        for (const [id, spot] of band.spots) positions.set(id, { x: spot.x, y: spot.y + cursor })
+        cursor += band.height + BAND_GAP
+      }
+      for (const item of items) if (item.position) positions.set(item.id, item.position)
+      const bottom = cursor
       const loose = items.filter(item => !positions.has(item.id))
-      loose.forEach((item, index) => positions.set(item.id, item.position ?? {
-        x: 0, y: yOffset + index * (CARD_H + GAP_Y),
+      loose.forEach((item, index) => positions.set(item.id, {
+        x: 0, y: bottom + index * (CARD_H + GAP_Y),
       }))
       return positions
     }
@@ -176,8 +284,8 @@ window.__ModuleLoader__.load({
       ].filter(Boolean).join('\n\n')
     }
 
-    const css = "/* 灰底 + 白卡 + 蓝色强调，Nothing 式留白/等宽微标签/细边框；浅色与深色各一套。 */\n.tm-shell {\n  --tm-paper: #e8e8e9;\n  --tm-panel: #f7f7f8;\n  --tm-text: #111112;\n  --tm-muted: #6b6b70;\n  --tm-line: #d5d5d8;\n  --tm-dot: #cececf;\n  --tm-soft: #ededee;\n  --tm-accent: #1a4fe0;\n  --tm-accent-hover: #143fb8;\n  --tm-card: #ffffff;\n  --tm-wire: #b6b6ba;\n  --tm-done: #f0f0f1;\n  --tm-live: #fff4f2;\n  --tm-error: #c0201a;\n  --tm-shadow: #11111210;\n  --tm-pulse: #e02b20;\n  container-type: inline-size;\n  box-sizing: border-box;\n  width: min(calc(100% - 32px), 1440px);\n  margin: 10px auto 20px;\n  border: 1px solid var(--tm-line);\n  border-radius: 16px;\n  overflow: clip;\n  color: var(--tm-text);\n  background: var(--tm-panel);\n  font: var(--dsw-font-size-text, 14px)/1.55 Inter, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif;\n  text-align: left;\n}\nbody[data-ds-dark-theme] .tm-shell {\n  --tm-paper: #101011;\n  --tm-panel: #161617;\n  --tm-text: #f2f2f3;\n  --tm-muted: #9a9aa0;\n  --tm-line: #2b2b2e;\n  --tm-dot: #2f2f33;\n  --tm-soft: #1f1f22;\n  --tm-accent: #7aa2ff;\n  --tm-accent-hover: #a3c0ff;\n  --tm-card: #1b1b1d;\n  --tm-wire: #4a4a50;\n  --tm-done: #1e1e20;\n  --tm-live: #241a1a;\n  --tm-error: #ff8b83;\n  --tm-shadow: #00000055;\n  --tm-pulse: #ff5449;\n}\n.tm-shell *, .tm-shell *::before, .tm-shell *::after { box-sizing: border-box; }\n.tm-shell h2, .tm-shell h3, .tm-shell p, .tm-shell dl { margin: 0; }\n.tm-shell button, .tm-shell textarea, .tm-shell input { font: inherit; }\n.tm-shell button, .tm-shell summary { color: inherit; cursor: pointer; }\n.tm-shell button:disabled { cursor: default; opacity: .52; }\n.tm-shell :focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 3px; }\n.tm-heading { display: flex; min-height: 74px; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--tm-line); background: var(--tm-panel); }\n.tm-heading-main, .tm-heading-actions { display: flex; align-items: center; gap: 12px; }\n.tm-heading h2 { display: flex; align-items: center; gap: 9px; font-size: 17px; letter-spacing: .02em; font-weight: 640; line-height: 1.35; }\n.tm-heading p { font-size: 11px; color: var(--tm-muted); font-family: ui-monospace, \"SF Mono\", Menlo, monospace; letter-spacing: .06em; margin-top: 2px; }\n.tm-logo { display: grid; place-items: center; width: 38px; height: 38px; color: var(--tm-text); background: var(--tm-soft); border: 1px solid var(--tm-line); border-radius: 8px; }\n.tm-usage { position: relative; z-index: 5; }\n.tm-usage summary { display: flex; align-items: center; gap: 7px; min-height: 36px; list-style: none; padding: 6px 10px; border: 1px solid var(--tm-line); border-radius: 7px; font-variant-numeric: tabular-nums; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; font-size: 11px; }\n.tm-usage summary::-webkit-details-marker { display: none; }\n.tm-usage small { color: var(--tm-muted); font-size: 10px; letter-spacing: .04em; }\n.tm-usage-pop { position: absolute; right: 0; top: calc(100% + 8px); width: 210px; background: var(--tm-card); border: 1px solid var(--tm-line); border-radius: 10px; padding: 14px; box-shadow: 0 10px 30px var(--tm-shadow); }\n.tm-usage-pop dl { display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; margin-top: 8px; font-size: 11px; color: var(--tm-muted); font-variant-numeric: tabular-nums; }\n.tm-usage-pop dd { margin: 0; color: var(--tm-text); }\n.tm-build { display: block; margin-top: 9px; color: var(--tm-muted); font-size: 10px; letter-spacing: .06em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-workbench { display: grid; grid-template-columns: minmax(0, 1fr) 288px; height: clamp(475px, 64vh, 690px); }\n.tm-stage { isolation: isolate; position: relative; min-height: 0; overflow: hidden; background-color: var(--tm-paper); background-image: radial-gradient(circle, var(--tm-dot) .9px, transparent 1.1px); background-size: 22px 22px; touch-action: none; cursor: grab; }\n.tm-stage:active { cursor: grabbing; }\n.tm-stage:focus-visible { outline-offset: -3px; }\n.tm-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }\n.tm-edges { width: 1px; height: 1px; position: absolute; overflow: visible; pointer-events: none; }\n.tm-edges path { fill: none; stroke: var(--tm-wire); stroke-width: 1.4; }\n.tm-edges circle { fill: var(--tm-wire); }\n.tm-edges [data-path=\"active\"] path { stroke: var(--tm-accent); stroke-width: 2.2; }\n.tm-edges [data-path=\"active\"] circle { fill: var(--tm-accent); }\n.tm-edges .tm-link { stroke: var(--tm-accent); stroke-width: 1.8; stroke-dasharray: 5 5; }\n.tm-node { position: absolute; width: 232px; height: 126px; }\n.tm-node[data-selected] { z-index: 2; }\n.tm-node[data-status=\"in_progress\"] { animation: tm-pulse 2.4s ease-in-out infinite; }\n.tm-card { color: inherit; display: flex; flex-direction: column; align-items: stretch; text-align: left; gap: 8px; width: 100%; height: 100%; padding: 12px 14px; border: 1px solid var(--tm-line); background: var(--tm-card); border-radius: 10px; box-shadow: 0 2px 10px var(--tm-shadow); transition: border-color .16s, background .16s, box-shadow .16s; overflow: hidden; }\n.tm-card:hover, .tm-node[data-selected] .tm-card { border-color: var(--tm-accent); }\n.tm-node[data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 10px var(--tm-shadow); }\n.tm-node[data-root] .tm-card { color: var(--tm-text); background: var(--tm-soft); }\n.tm-node[data-status=\"completed\"] .tm-card { background: var(--tm-done); }\n.tm-node[data-status=\"in_progress\"] .tm-card { background: var(--tm-live); border-color: color-mix(in srgb, var(--tm-pulse) 42%, var(--tm-line)); }\n.tm-node[data-muted] .tm-card { background: var(--tm-card); box-shadow: none; opacity: .62; }\n.tm-card-top { display: flex; align-items: center; gap: 8px; color: var(--tm-muted); font-size: 11px; letter-spacing: .04em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; text-transform: uppercase; }\n.tm-card-top > svg { margin-left: auto; }\n.tm-kind { display: grid; place-items: center; width: 22px; height: 22px; color: var(--tm-text); border: 1px solid var(--tm-line); border-radius: 5px; background: var(--tm-card); flex-shrink: 0; }\n.tm-card-no { font-size: 10px; font-variant-numeric: tabular-nums; }\n.tm-card-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; font-size: 15px; font-weight: 620; line-height: 1.4; letter-spacing: -.01em; }\n.tm-card-foot { display: flex; align-items: center; gap: 6px; color: var(--tm-muted); font-size: 10px; letter-spacing: .04em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; line-height: 1.2; margin-top: auto; white-space: nowrap; overflow: hidden; }\n.tm-card-foot svg { flex-shrink: 0; }\n.tm-live { display: inline-block; width: 7px; height: 7px; border-radius: 2px; background: var(--tm-pulse); flex-shrink: 0; animation: tm-blink 1.05s steps(1, end) infinite; }\n.tm-heading h2 .tm-live { margin-left: 2px; }\n.tm-card-delete { position: absolute; z-index: 4; top: -9px; right: -9px; width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 1px solid var(--tm-line); border-radius: 5px; background: var(--tm-card); color: var(--tm-muted); opacity: 0; transform: scale(.92); transition: opacity .14s, color .14s, border-color .14s, transform .14s; }\n.tm-node:hover .tm-card-delete, .tm-node[data-selected] .tm-card-delete { opacity: 1; transform: none; }\n.tm-card-delete:hover { color: var(--tm-error); border-color: var(--tm-error); }\n.tm-port { position: absolute; z-index: 3; right: -6px; top: calc(50% - 6px); width: 12px; height: 12px; padding: 0; border: 1.5px solid var(--tm-line); border-radius: 3px; background: var(--tm-card); cursor: crosshair; transition: border-color .16s, background .16s, transform .16s; }\n.tm-port:hover, .tm-node[data-selected] .tm-port { border-color: var(--tm-accent); background: var(--tm-accent); transform: scale(1.1); }\n.tm-dock { cursor: default; position: absolute; z-index: 3; display: flex; align-items: center; gap: 1px; left: 50%; bottom: 16px; transform: translateX(-50%); padding: 4px; border: 1px solid var(--tm-line); border-radius: 11px; background: color-mix(in srgb, var(--tm-panel) 90%, transparent); backdrop-filter: blur(12px); box-shadow: 0 6px 20px var(--tm-shadow); }\n.tm-zoom { font-size: 11px; color: var(--tm-muted); min-width: 42px; text-align: center; font-variant-numeric: tabular-nums; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-dock-divider { width: 1px; height: 18px; background: var(--tm-line); margin: 0 3px; }\n.tm-shell .tm-block-add { display: inline-flex; align-items: center; justify-content: center; width: 32px; min-height: 32px; padding: 0; border: 1px solid var(--tm-text); border-radius: 6px; background: var(--tm-text); color: var(--tm-panel); transition: background .16s, border-color .16s, color .16s; }\n.tm-shell .tm-block-add:hover { background: var(--tm-accent); border-color: var(--tm-accent); color: #fff; }\n.tm-shell .tm-block-add:active { background: var(--tm-accent-hover); border-color: var(--tm-accent-hover); }\n.tm-button { min-height: 32px; min-width: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 5px 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; transition: background .16s ease, color .16s ease; }\n.tm-button:hover:not(:disabled) { background: var(--tm-soft); }\n.tm-button:active:not(:disabled) { filter: brightness(.94); }\n.tm-shell .tm-primary { background: var(--tm-text); color: var(--tm-panel); min-height: 38px; font-weight: 620; }\n.tm-shell .tm-primary:hover:not(:disabled) { background: var(--tm-accent); color: #fff; }\n.tm-inspector { min-width: 0; overflow: auto; border-left: 1px solid var(--tm-line); padding: 15px 17px 22px; background: var(--tm-panel); overscroll-behavior: contain; }\n.tm-inspector-head { display: flex; justify-content: space-between; align-items: center; min-height: 33px; color: var(--tm-muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-inspector-head .tm-button { margin-right: -5px; }\n.tm-node-meta { display: flex; align-items: center; gap: 5px; font-size: 11px; letter-spacing: .04em; color: var(--tm-accent); margin: 11px 0 5px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-inspector h3 { font-size: 16px; font-weight: 660; line-height: 1.45; overflow-wrap: anywhere; letter-spacing: -.01em; }\n.tm-inspector p { overflow-wrap: anywhere; }\n.tm-detail-title > p, .tm-empty > p { margin-top: 6px; font-size: 13px; color: var(--tm-muted); white-space: pre-wrap; }\n.tm-shell .tm-edit-link { color: var(--tm-accent); padding-left: 0; margin: 3px 0; font-size: 12px; }\n.tm-edit, .tm-guide { display: grid; gap: 9px; }\n.tm-edit label { display: grid; gap: 5px; }\n.tm-form-actions { display: flex; justify-content: end; gap: 5px; margin-bottom: 8px; }\n.tm-dependencies, .tm-history { border-top: 1px solid var(--tm-line); padding: 6px 0; font-size: 13px; }\n.tm-dependencies summary, .tm-history summary { min-height: 34px; padding-top: 7px; }\n.tm-dependencies summary span, .tm-history summary span { float: right; color: var(--tm-muted); margin-left: 4px; font-size: 11px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-parent-list { display: grid; gap: 5px; max-height: 128px; overflow: auto; padding: 4px 0 8px; font-size: 12px; color: var(--tm-muted); }\n.tm-parent-list label, .tm-approval { display: flex; gap: 7px; align-items: start; cursor: pointer; }\n.tm-shell input[type=\"checkbox\"] { accent-color: var(--tm-accent); margin-top: 3px; flex-shrink: 0; }\n.tm-guide { border-top: 1px solid var(--tm-line); padding: 13px 0; }\n.tm-guide-label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-weight: 640; }\n.tm-shell textarea, .tm-shell input:not([type=\"checkbox\"]) { width: 100%; resize: vertical; padding: 9px; border: 1px solid var(--tm-line); border-radius: 7px; color: var(--tm-text); background: var(--tm-card); font-size: 13px; }\n.tm-shell textarea { min-height: 58px; margin-top: 2px; font-weight: 400; }\n.tm-shell textarea::placeholder { color: var(--tm-muted); opacity: 1; }\n.tm-media { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }\n.tm-thumb { position: relative; display: block; width: 54px; height: 54px; border-radius: 6px; overflow: hidden; border: 1px solid var(--tm-line); background: var(--tm-soft); }\n.tm-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }\n.tm-shell .tm-thumb-remove { position: absolute; right: 2px; top: 2px; width: 17px; height: 17px; min-width: 0; min-height: 0; display: grid; place-items: center; padding: 0; border: 0; border-radius: 3px; background: #111112cc; color: #fff; }\n.tm-media-add { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 0 9px; border: 1px dashed var(--tm-line); border-radius: 6px; background: transparent; color: var(--tm-muted); font-size: 12px; }\n.tm-media-add:hover:not(:disabled) { border-color: var(--tm-accent); color: var(--tm-accent); }\n.tm-shell input.tm-file { position: absolute; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; }\n.tm-approval { font-size: 13px; }\n.tm-send { justify-content: space-between; text-align: left; font-size: 12px !important; }\n.tm-error { color: var(--tm-error); font-size: 12px; }\n.tm-notice { color: var(--tm-accent); font-size: 12px; }\n.tm-empty h3 { margin-top: 12px; }\n.tm-empty .tm-task-text { max-height: 6em; overflow: auto; color: var(--tm-text); }\n.tm-empty .tm-button { margin-top: 11px; }\n.tm-back { color: var(--tm-accent) !important; }\n.tm-history ol { display: grid; gap: 7px; padding-left: 19px; margin: 3px 0 8px; }\n.tm-history p { white-space: pre-wrap; font-size: 12px; }\n.tm-shell .tm-remove { color: var(--tm-error); font-size: 12px; padding-left: 0; }\n@keyframes tm-blink { 0%, 100% { opacity: 1; } 50% { opacity: .12; } }\n@keyframes tm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .74; } }\n@container (max-width: 690px) {\n  .tm-workbench { height: auto; grid-template-columns: minmax(0, 1fr); }\n  .tm-stage { height: 360px; }\n  .tm-inspector { border-left: 0; border-top: 1px solid var(--tm-line); overflow: visible; }\n}\n@container (max-width: 420px) {\n  .tm-heading { padding: 10px 12px; min-height: 62px; }\n  .tm-heading h2 { font-size: 15px; }\n  .tm-logo { width: 32px; height: 32px; }\n  .tm-stage { height: 305px; }\n}\n@media (prefers-reduced-motion: reduce) {\n  .tm-shell *, .tm-shell *::before, .tm-shell *::after { transition: none !important; animation: none !important; }\n}\n\n/* 回答进行中：目标卡片高亮 + 呼吸 */\n.tm-node[data-live] { animation: tm-pulse 1.6s ease-in-out infinite; }\n.tm-node[data-live] .tm-card { border-color: var(--tm-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--tm-accent) 42%, transparent), 0 2px 14px var(--tm-shadow); }\n.tm-node[data-live][data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 14px var(--tm-shadow); }\n/* 状态切换与自动完成 */\n.tm-status-row { display: flex; gap: 4px; margin: 8px 0 4px; }\n.tm-status-chip { flex: 1; min-height: 26px; padding: 3px 6px; border: 1px solid var(--tm-line); border-radius: 6px; background: var(--tm-card); color: var(--tm-muted); font-size: 11px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; letter-spacing: .04em; transition: color .16s, border-color .16s, background .16s; }\n.tm-status-chip:hover { border-color: var(--tm-text); color: var(--tm-text); }\n.tm-status-chip[aria-pressed=\"true\"] { background: var(--tm-text); border-color: var(--tm-text); color: var(--tm-panel); }\n.tm-auto { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0 6px; padding: 5px 8px; border: 1px dashed color-mix(in srgb, var(--tm-accent) 45%, var(--tm-line)); border-radius: 6px; color: var(--tm-accent); font-size: 11px; }\n.tm-auto-toggle { display: flex; align-items: center; gap: 7px; margin: 4px 0 10px; color: var(--tm-muted); font-size: 11px; cursor: pointer; }\n.tm-auto-toggle input { accent-color: var(--tm-accent); }\n@media (prefers-reduced-motion: reduce) { .tm-node[data-live] { animation: none; } }\n"
-    const buildStamp = "0afcb57a"
+    const css = "/* 灰底 + 白卡 + 蓝色强调，Nothing 式留白/等宽微标签/细边框；浅色与深色各一套。 */\n.tm-shell {\n  --tm-paper: #e8e8e9;\n  --tm-panel: #f7f7f8;\n  --tm-text: #111112;\n  --tm-muted: #6b6b70;\n  --tm-line: #d5d5d8;\n  --tm-dot: #cececf;\n  --tm-soft: #ededee;\n  --tm-accent: #1a4fe0;\n  --tm-accent-hover: #143fb8;\n  --tm-card: #ffffff;\n  --tm-wire: #b6b6ba;\n  --tm-done: #f0f0f1;\n  --tm-live: #fff4f2;\n  --tm-error: #c0201a;\n  --tm-shadow: #11111210;\n  --tm-pulse: #e02b20;\n  --tm-root: #17191f;\n  --tm-on-root: #f4f6fa;\n  container-type: inline-size;\n  box-sizing: border-box;\n  width: min(calc(100% - 32px), 1440px);\n  margin: 10px auto 20px;\n  border: 1px solid var(--tm-line);\n  border-radius: 16px;\n  overflow: clip;\n  color: var(--tm-text);\n  background: var(--tm-panel);\n  font: var(--dsw-font-size-text, 14px)/1.55 Inter, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif;\n  text-align: left;\n}\nbody[data-ds-dark-theme] .tm-shell {\n  --tm-paper: #101011;\n  --tm-panel: #161617;\n  --tm-text: #f2f2f3;\n  --tm-muted: #9a9aa0;\n  --tm-line: #2b2b2e;\n  --tm-dot: #2f2f33;\n  --tm-soft: #1f1f22;\n  --tm-accent: #7aa2ff;\n  --tm-accent-hover: #a3c0ff;\n  --tm-card: #1b1b1d;\n  --tm-wire: #4a4a50;\n  --tm-done: #1e1e20;\n  --tm-live: #241a1a;\n  --tm-error: #ff8b83;\n  --tm-shadow: #00000055;\n  --tm-pulse: #ff5449;\n  --tm-root: #262a33;\n  --tm-on-root: #eef2f8;\n}\n.tm-shell *, .tm-shell *::before, .tm-shell *::after { box-sizing: border-box; }\n.tm-shell h2, .tm-shell h3, .tm-shell p, .tm-shell dl { margin: 0; }\n.tm-shell button, .tm-shell textarea, .tm-shell input { font: inherit; }\n.tm-shell button, .tm-shell summary { color: inherit; cursor: pointer; }\n.tm-shell button:disabled { cursor: default; opacity: .52; }\n.tm-shell :focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 3px; }\n.tm-heading { display: flex; min-height: 74px; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--tm-line); background: var(--tm-panel); }\n.tm-heading-main, .tm-heading-actions { display: flex; align-items: center; gap: 12px; }\n.tm-heading h2 { display: flex; align-items: center; gap: 9px; font-size: 17px; letter-spacing: .02em; font-weight: 640; line-height: 1.35; }\n.tm-heading p { font-size: 11px; color: var(--tm-muted); font-family: ui-monospace, \"SF Mono\", Menlo, monospace; letter-spacing: .06em; margin-top: 2px; }\n.tm-logo { display: grid; place-items: center; width: 38px; height: 38px; color: var(--tm-text); background: var(--tm-soft); border: 1px solid var(--tm-line); border-radius: 8px; }\n.tm-usage { position: relative; z-index: 5; }\n.tm-usage summary { display: flex; align-items: center; gap: 7px; min-height: 36px; list-style: none; padding: 6px 10px; border: 1px solid var(--tm-line); border-radius: 7px; font-variant-numeric: tabular-nums; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; font-size: 11px; }\n.tm-usage summary::-webkit-details-marker { display: none; }\n.tm-usage small { color: var(--tm-muted); font-size: 10px; letter-spacing: .04em; }\n.tm-usage-pop { position: absolute; right: 0; top: calc(100% + 8px); width: 210px; background: var(--tm-card); border: 1px solid var(--tm-line); border-radius: 10px; padding: 14px; box-shadow: 0 10px 30px var(--tm-shadow); }\n.tm-usage-pop dl { display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; margin-top: 8px; font-size: 11px; color: var(--tm-muted); font-variant-numeric: tabular-nums; }\n.tm-usage-pop dd { margin: 0; color: var(--tm-text); }\n.tm-build { display: block; margin-top: 9px; color: var(--tm-muted); font-size: 10px; letter-spacing: .06em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-workbench { display: grid; grid-template-columns: minmax(0, 1fr) 288px; height: clamp(475px, 64vh, 690px); }\n.tm-stage { isolation: isolate; position: relative; min-height: 0; overflow: hidden; background-color: var(--tm-paper); background-image: radial-gradient(circle, var(--tm-dot) .9px, transparent 1.1px); background-size: 22px 22px; touch-action: none; cursor: grab; }\n.tm-stage:active { cursor: grabbing; }\n.tm-stage:focus-visible { outline-offset: -3px; }\n.tm-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }\n.tm-edges { width: 1px; height: 1px; position: absolute; overflow: visible; pointer-events: none; }\n.tm-arrow { fill: none; stroke: var(--tm-wire); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }\n.tm-edges g[data-path=\"active\"] .tm-arrow { stroke: var(--tm-accent); }\n.tm-edges path { fill: none; stroke: var(--tm-wire); stroke-width: 1.4; }\n.tm-edges circle { fill: var(--tm-wire); }\n.tm-edges [data-path=\"active\"] path { stroke: var(--tm-accent); stroke-width: 2.2; }\n.tm-edges [data-path=\"active\"] circle { fill: var(--tm-accent); }\n.tm-edges .tm-link { stroke: var(--tm-accent); stroke-width: 1.8; stroke-dasharray: 5 5; }\n.tm-node { position: absolute; width: 232px; height: 126px; transition: left .14s ease-out, top .14s ease-out; }\n.tm-node[data-dragging] { transition: none; z-index: 3; }\n.tm-node[data-selected] { z-index: 2; }\n.tm-node[data-status=\"in_progress\"] { animation: tm-pulse 2.4s ease-in-out infinite; }\n.tm-card { color: inherit; display: flex; flex-direction: column; align-items: stretch; text-align: left; gap: 8px; width: 100%; height: 100%; padding: 12px 14px; border: 1px solid var(--tm-line); background: var(--tm-card); border-radius: 12px; box-shadow: 0 2px 10px var(--tm-shadow); transition: border-color .16s, background .16s, box-shadow .16s; overflow: hidden; }\n.tm-card:hover, .tm-node[data-selected] .tm-card { border-color: var(--tm-accent); }\n.tm-node[data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 10px var(--tm-shadow); }\n.tm-node[data-root] .tm-card { color: var(--tm-on-root); background: var(--tm-root); border-color: var(--tm-root); box-shadow: 0 10px 26px #11111226; }\n.tm-node[data-root] .tm-card-top, .tm-node[data-root] .tm-card-foot { color: color-mix(in srgb, var(--tm-on-root) 62%, transparent); }\n.tm-node[data-root] .tm-kind { color: var(--tm-on-root); background: color-mix(in srgb, var(--tm-on-root) 10%, transparent); border-color: color-mix(in srgb, var(--tm-on-root) 24%, transparent); }\n.tm-node[data-root] .tm-card-title { color: var(--tm-on-root); }\n.tm-node[data-status=\"completed\"] .tm-card { background: var(--tm-done); }\n.tm-node[data-status=\"in_progress\"] .tm-card { background: var(--tm-live); border-color: color-mix(in srgb, var(--tm-pulse) 42%, var(--tm-line)); }\n.tm-node[data-muted] .tm-card { background: var(--tm-card); box-shadow: none; opacity: .62; }\n.tm-card-top { display: flex; align-items: center; gap: 8px; color: var(--tm-muted); font-size: 11px; letter-spacing: .04em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; text-transform: uppercase; }\n.tm-card-top > svg { margin-left: auto; }\n.tm-kind { display: grid; place-items: center; width: 22px; height: 22px; color: var(--tm-text); border: 1px solid var(--tm-line); border-radius: 5px; background: var(--tm-card); flex-shrink: 0; }\n.tm-card-no { font-size: 10px; font-variant-numeric: tabular-nums; }\n.tm-card-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; font-size: 15px; font-weight: 620; line-height: 1.4; letter-spacing: -.01em; }\n.tm-card-foot { display: flex; align-items: center; gap: 6px; color: var(--tm-muted); font-size: 10px; letter-spacing: .04em; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; line-height: 1.2; margin-top: auto; white-space: nowrap; overflow: hidden; }\n.tm-card-foot svg { flex-shrink: 0; }\n.tm-live { display: inline-block; width: 7px; height: 7px; border-radius: 2px; background: var(--tm-pulse); flex-shrink: 0; animation: tm-blink 1.05s steps(1, end) infinite; }\n.tm-heading h2 .tm-live { margin-left: 2px; }\n.tm-card-delete { position: absolute; z-index: 4; top: -9px; right: -9px; width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 1px solid var(--tm-line); border-radius: 5px; background: var(--tm-card); color: var(--tm-muted); opacity: 0; transform: scale(.92); transition: opacity .14s, color .14s, border-color .14s, transform .14s; }\n.tm-node:hover .tm-card-delete, .tm-node[data-selected] .tm-card-delete { opacity: 1; transform: none; }\n.tm-card-delete:hover { color: var(--tm-error); border-color: var(--tm-error); }\n.tm-port { position: absolute; z-index: 3; right: -6px; top: calc(50% - 6px); width: 12px; height: 12px; padding: 0; border: 1.5px solid var(--tm-line); border-radius: 3px; background: var(--tm-card); cursor: crosshair; transition: border-color .16s, background .16s, transform .16s; }\n.tm-port:hover, .tm-node[data-selected] .tm-port { border-color: var(--tm-accent); background: var(--tm-accent); transform: scale(1.1); }\n.tm-dock { cursor: default; position: absolute; z-index: 3; display: flex; align-items: center; gap: 1px; left: 50%; bottom: 16px; transform: translateX(-50%); padding: 4px; border: 1px solid var(--tm-line); border-radius: 11px; background: color-mix(in srgb, var(--tm-panel) 90%, transparent); backdrop-filter: blur(12px); box-shadow: 0 6px 20px var(--tm-shadow); }\n.tm-zoom { font-size: 11px; color: var(--tm-muted); min-width: 42px; text-align: center; font-variant-numeric: tabular-nums; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-dock-divider { width: 1px; height: 18px; background: var(--tm-line); margin: 0 3px; }\n.tm-shell .tm-block-add { display: inline-flex; align-items: center; justify-content: center; width: 32px; min-height: 32px; padding: 0; border: 1px solid var(--tm-text); border-radius: 6px; background: var(--tm-text); color: var(--tm-panel); transition: background .16s, border-color .16s, color .16s; }\n.tm-shell .tm-block-add:hover { background: var(--tm-accent); border-color: var(--tm-accent); color: #fff; }\n.tm-shell .tm-block-add:active { background: var(--tm-accent-hover); border-color: var(--tm-accent-hover); }\n.tm-shell .tm-locate { display: inline-flex; align-items: center; justify-content: center; width: 32px; min-height: 32px; padding: 0; border: 1px solid var(--tm-line); border-radius: 6px; background: transparent; color: var(--tm-text); transition: border-color .16s, color .16s, background .16s; }\n.tm-shell .tm-locate:hover { border-color: var(--tm-accent); color: var(--tm-accent); background: var(--tm-soft); }\n.tm-band-link { fill: none; stroke: var(--tm-wire); stroke-width: 1.4; stroke-dasharray: 3 5; opacity: .85; }\n.tm-shell .tm-locate[data-active] { border-color: var(--tm-accent); color: var(--tm-accent); background: var(--tm-soft); }\n.tm-focus { font-size: 11px; letter-spacing: .06em; color: var(--tm-accent); padding: 0 5px 0 3px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-button { min-height: 32px; min-width: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 5px 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; transition: background .16s ease, color .16s ease; }\n.tm-button:hover:not(:disabled) { background: var(--tm-soft); }\n.tm-button:active:not(:disabled) { filter: brightness(.94); }\n.tm-shell .tm-primary { background: var(--tm-text); color: var(--tm-panel); min-height: 38px; font-weight: 620; }\n.tm-shell .tm-primary:hover:not(:disabled) { background: var(--tm-accent); color: #fff; }\n.tm-inspector { min-width: 0; overflow: auto; border-left: 1px solid var(--tm-line); padding: 15px 17px 22px; background: var(--tm-panel); overscroll-behavior: contain; }\n.tm-inspector-head { display: flex; justify-content: space-between; align-items: center; min-height: 33px; color: var(--tm-muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-inspector-head .tm-button { margin-right: -5px; }\n.tm-node-meta { display: flex; align-items: center; gap: 5px; font-size: 11px; letter-spacing: .04em; color: var(--tm-accent); margin: 11px 0 5px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-inspector h3 { font-size: 16px; font-weight: 660; line-height: 1.45; overflow-wrap: anywhere; letter-spacing: -.01em; }\n.tm-inspector p { overflow-wrap: anywhere; }\n.tm-detail-title > p, .tm-empty > p { margin-top: 6px; font-size: 13px; color: var(--tm-muted); white-space: pre-wrap; }\n.tm-shell .tm-edit-link { color: var(--tm-accent); padding-left: 0; margin: 3px 0; font-size: 12px; }\n.tm-edit, .tm-guide { display: grid; gap: 9px; }\n.tm-edit label { display: grid; gap: 5px; }\n.tm-form-actions { display: flex; justify-content: end; gap: 5px; margin-bottom: 8px; }\n.tm-dependencies, .tm-history { border-top: 1px solid var(--tm-line); padding: 6px 0; font-size: 13px; }\n.tm-dependencies summary, .tm-history summary { min-height: 34px; padding-top: 7px; }\n.tm-dependencies summary span, .tm-history summary span { float: right; color: var(--tm-muted); margin-left: 4px; font-size: 11px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; }\n.tm-parent-list { display: grid; gap: 5px; max-height: 128px; overflow: auto; padding: 4px 0 8px; font-size: 12px; color: var(--tm-muted); }\n.tm-parent-list label, .tm-approval { display: flex; gap: 7px; align-items: start; cursor: pointer; }\n.tm-shell input[type=\"checkbox\"] { accent-color: var(--tm-accent); margin-top: 3px; flex-shrink: 0; }\n.tm-guide { border-top: 1px solid var(--tm-line); padding: 13px 0; }\n.tm-guide-label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-weight: 640; }\n.tm-shell textarea, .tm-shell input:not([type=\"checkbox\"]) { width: 100%; resize: vertical; padding: 9px; border: 1px solid var(--tm-line); border-radius: 7px; color: var(--tm-text); background: var(--tm-card); font-size: 13px; }\n.tm-shell textarea { min-height: 58px; margin-top: 2px; font-weight: 400; }\n.tm-shell textarea::placeholder { color: var(--tm-muted); opacity: 1; }\n.tm-media { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }\n.tm-thumb { position: relative; display: block; width: 54px; height: 54px; border-radius: 6px; overflow: hidden; border: 1px solid var(--tm-line); background: var(--tm-soft); }\n.tm-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }\n.tm-shell .tm-thumb-remove { position: absolute; right: 2px; top: 2px; width: 17px; height: 17px; min-width: 0; min-height: 0; display: grid; place-items: center; padding: 0; border: 0; border-radius: 3px; background: #111112cc; color: #fff; }\n.tm-media-add { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 0 9px; border: 1px dashed var(--tm-line); border-radius: 6px; background: transparent; color: var(--tm-muted); font-size: 12px; }\n.tm-media-add:hover:not(:disabled) { border-color: var(--tm-accent); color: var(--tm-accent); }\n.tm-shell input.tm-file { position: absolute; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; }\n.tm-approval { font-size: 13px; }\n.tm-send { justify-content: space-between; text-align: left; font-size: 12px !important; }\n.tm-error { color: var(--tm-error); font-size: 12px; }\n.tm-notice { color: var(--tm-accent); font-size: 12px; }\n.tm-empty h3 { margin-top: 12px; }\n.tm-empty .tm-task-text { max-height: 6em; overflow: auto; color: var(--tm-text); }\n.tm-empty .tm-button { margin-top: 11px; }\n.tm-back { color: var(--tm-accent) !important; }\n.tm-history ol { display: grid; gap: 7px; padding-left: 19px; margin: 3px 0 8px; }\n.tm-history p { white-space: pre-wrap; font-size: 12px; }\n.tm-shell .tm-remove { color: var(--tm-error); font-size: 12px; padding-left: 0; }\n@keyframes tm-blink { 0%, 100% { opacity: 1; } 50% { opacity: .12; } }\n@keyframes tm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .74; } }\n@container (max-width: 690px) {\n  .tm-workbench { height: auto; grid-template-columns: minmax(0, 1fr); }\n  .tm-stage { height: 360px; }\n  .tm-inspector { border-left: 0; border-top: 1px solid var(--tm-line); overflow: visible; }\n}\n@container (max-width: 420px) {\n  .tm-heading { padding: 10px 12px; min-height: 62px; }\n  .tm-heading h2 { font-size: 15px; }\n  .tm-logo { width: 32px; height: 32px; }\n  .tm-stage { height: 305px; }\n}\n@media (prefers-reduced-motion: reduce) {\n  .tm-shell *, .tm-shell *::before, .tm-shell *::after { transition: none !important; animation: none !important; }\n}\n\n/* 回答进行中：目标卡片高亮 + 呼吸 */\n.tm-node[data-live] { animation: tm-pulse 1.6s ease-in-out infinite; }\n.tm-node[data-live] .tm-card { border-color: var(--tm-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--tm-accent) 42%, transparent), 0 2px 14px var(--tm-shadow); }\n.tm-node[data-live][data-selected] .tm-card { box-shadow: 0 0 0 2px var(--tm-accent), 0 2px 14px var(--tm-shadow); }\n/* 状态切换与自动完成 */\n.tm-status-row { display: flex; gap: 4px; margin: 8px 0 4px; }\n.tm-status-chip { flex: 1; min-height: 26px; padding: 3px 6px; border: 1px solid var(--tm-line); border-radius: 6px; background: var(--tm-card); color: var(--tm-muted); font-size: 11px; font-family: ui-monospace, \"SF Mono\", Menlo, monospace; letter-spacing: .04em; transition: color .16s, border-color .16s, background .16s; }\n.tm-status-chip:hover { border-color: var(--tm-text); color: var(--tm-text); }\n.tm-status-chip[aria-pressed=\"true\"] { background: var(--tm-text); border-color: var(--tm-text); color: var(--tm-panel); }\n.tm-auto { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0 6px; padding: 5px 8px; border: 1px dashed color-mix(in srgb, var(--tm-accent) 45%, var(--tm-line)); border-radius: 6px; color: var(--tm-accent); font-size: 11px; }\n.tm-auto-toggle { display: flex; align-items: center; gap: 7px; margin: 4px 0 10px; color: var(--tm-muted); font-size: 11px; cursor: pointer; }\n.tm-auto-toggle input { accent-color: var(--tm-accent); }\n@media (prefers-reduced-motion: reduce) { .tm-node[data-live] { animation: none; } .tm-node { transition: none; } }\n\n.tm-node[data-current] > .tm-card {\n  outline: 1.5px solid var(--tm-accent);\n  outline-offset: 3px;\n}\n\n.tm-scope {\n  display: inline-flex;\n  gap: 2px;\n  padding: 2px;\n  border: 1px solid var(--tm-line);\n  border-radius: 999px;\n  background: var(--tm-panel);\n}\n\n.tm-scope-button {\n  padding: 3px 10px;\n  border: 0;\n  border-radius: 999px;\n  background: transparent;\n  color: var(--tm-muted);\n  font: 500 11px/1.4 var(--tm-mono, ui-monospace, SFMono-Regular, Menlo, monospace);\n  cursor: pointer;\n}\n\n.tm-scope-button[data-active] {\n  background: var(--tm-text);\n  color: var(--tm-panel);\n}\n"
+    const buildStamp = "c14881f2"
     const locales = {"zh":{"name":"任务地图","meta":{"title":"任务地图","description":"在当前会话查看 DeepSeek 待办的节点地图，编辑步骤与依赖，发送节点 Guide 并查看会话 token 用量。"}},"en":{"name":"Task map","meta":{"title":"Task map","description":"View this session’s DeepSeek plan as a map, edit steps and dependencies, send node guides, and inspect session token usage."}}}
     const glyphs = {
       map: 'M4 5h5v5H4zM15 3h5v5h-5zM15 16h5v5h-5zM9 7.5h3v11h3M12 5.5h3',
@@ -192,6 +300,7 @@ window.__ModuleLoader__.load({
       refresh: 'M20 7v5h-5M4 17v-5h5M20 12a8 8 0 0 0-14-5m-2 5a8 8 0 0 0 14 5',
       square: 'M4 4h16v16H4zM9 9h6v6H9z',
       image: 'M4 5h16v14H4zM4 15l4.5-4.5 3.5 3.5 3-3L20 15M15.5 9.5h.01',
+      target: 'M12 3v3.2m0 11.6V21M3 12h3.2m11.6 0H21M12 8.4a3.6 3.6 0 1 0 0 7.2 3.6 3.6 0 0 0 0-7.2Z',
     }
     const icons = (name, size = 16) => h('svg', {
       viewBox: '0 0 24 24', width: size, height: size, 'aria-hidden': true,
@@ -217,6 +326,21 @@ window.__ModuleLoader__.load({
     const statusIcons = { pending: 'pending', in_progress: 'active', completed: 'check' }
     const EMPTY_PLAN = { task: null, plan: null }
     const EMPTY_TODOS = []
+    function missionEdges(groups) {
+      const edges = []
+      groups.forEach((group, index) => {
+        const words = (group.refs ?? []).some(ref => ref.kind === 'word')
+        for (let back = index - 1; back >= 0; back--) {
+          const previous = groups[back].refs ?? []
+          const hits = (group.refs ?? []).filter(ref => previous.some(other => other.text.toLowerCase() === ref.text.toLowerCase()))
+          if (hits.length || (words && back === index - 1)) {
+            edges.push({ from: groups[back].key, to: group.key, back, index, hits })
+            break
+          }
+        }
+      })
+      return edges
+    }
 
     function Action({ icon, label, text, className = '', ...props }) {
       return h('button', {
@@ -242,7 +366,7 @@ window.__ModuleLoader__.load({
           h('small', { className: 'tm-build' }, 'build ' + buildStamp)))
     }
 
-    function Canvas({ nodes, title, selected, select, add, connect, move, remove, onBlank, openGuide, running, activeId }) {
+    function Canvas({ nodes, title, selected, select, add, connect, move, remove, onBlank, openGuide, running, activeId, edges = [], currentKey, focus, setFocus }) {
       const viewport = useRef(null)
       const gesture = useRef(null)
       const ignoreClick = useRef(false)
@@ -250,8 +374,10 @@ window.__ModuleLoader__.load({
       const manual = useRef(false)
       const [view, setView] = useState({ x: 30, y: 100, zoom: 0.8 })
       const [drag, setDrag] = useState(null)
+      const [push, setPush] = useState(null)
       const [link, setLink] = useState(null)
-      const positions = useMemo(() => layout(nodes), [nodes])
+      const visible = useMemo(() => focus ? focusOnly(nodes, focus) : nodes, [nodes, focus])
+      const positions = useMemo(() => focus ? focusLayout(visible, focus) : layout(visible), [visible, focus])
       const bounds = useMemo(() => {
         const points = [...positions.values()]
         if (!points.length) return { left: 0, top: 0, right: CARD_W, bottom: CARD_H }
@@ -267,25 +393,48 @@ window.__ModuleLoader__.load({
       const approved = new Set(nodes.flatMap(node => node.guides.flatMap(item => item.approvedIds ?? [])))
       const rootIds = useMemo(() => new Set(nodes.filter(node => node.root).map(node => node.id)), [nodes])
 
-      function fit() {
+      function fit(minZoom = 0.15) {
         const box = viewport.current
         if (!box) return
         const width = bounds.right - bounds.left
         const height = bounds.bottom - bounds.top
         const factor = (box.clientWidth - 80) / width
-        const zoom = Math.min(1, Math.max(0.15, Math.min(factor, (box.clientHeight - 130) / height)))
+        const zoom = Math.min(1, Math.max(minZoom, Math.min(factor, (box.clientHeight - 130) / height)))
         setView({
           zoom,
           x: Math.max(28, (box.clientWidth - width * zoom) / 2) - bounds.left * zoom,
           y: Math.max(46, (box.clientHeight - height * zoom) / 2 - 12) - bounds.top * zoom,
         })
       }
+      function focusMission(key) {
+        const spot = positions.get('root:' + key)
+        const box = viewport.current
+        if (!spot || !box) return
+        setView(current => ({
+          ...current,
+          x: box.clientWidth / 2 - (spot.x + CARD_W / 2) * current.zoom,
+          y: box.clientHeight / 2 - (spot.y + CARD_H / 2) * current.zoom,
+        }))
+      }
       useLayoutEffect(() => {
-        if (!manual.current) fit()
+        if (!manual.current) fit(visible.filter(node => node.root).length === 1 ? 0.75 : 0.15)
         const watcher = new ResizeObserver(() => { if (!manual.current) fit() })
         watcher.observe(viewport.current)
         return () => watcher.disconnect()
       }, [bounds])
+
+      function locate() {
+        const cards = nodes.filter(node => !node.root)
+        const target = (running && cards.find(node => node.id === activeId))
+          || [...cards].reverse().find(node => node.status === 'in_progress')
+          || [...cards].reverse()[0]
+        const box = viewport.current
+        if (!target || !box) return
+        manual.current = true
+        select(target.id)
+        setFocus(target.id)
+        setView({ zoom: 1, x: box.clientWidth / 2, y: box.clientHeight / 2 })
+      }
 
       function zoomBy(factor, clientX, clientY) {
         const box = viewport.current.getBoundingClientRect()
@@ -343,8 +492,10 @@ window.__ModuleLoader__.load({
           viewport.current.setPointerCapture(event.pointerId)
         }
         const position = point(event, current)
-        if (current.id) setDrag({ id: current.id, position })
-        else setView(value => ({ ...value, ...position }))
+        if (current.id) {
+          setDrag({ id: current.id, position })
+          setPush(repel(current.id, position))
+        } else setView(value => ({ ...value, ...position }))
       }
 
       function release(event, cancelled = false) {
@@ -353,7 +504,11 @@ window.__ModuleLoader__.load({
         gesture.current = null
         ignoreClick.current = current.moved
         setDrag(null)
-        if (!cancelled && current.id && current.moved) move(current.id, point(event, current))
+        setPush(null)
+        if (!cancelled && current.id && current.moved) {
+          move(current.id, point(event, current))
+          if (push) for (const [id, position] of push) move(id, position)
+        }
         if (!cancelled && !current.id && !current.moved && !event.target.closest('button')) onBlank()
       }
 
@@ -380,7 +535,33 @@ window.__ModuleLoader__.load({
         }
         setView(v => ({ ...v, x: v.x - direction[0] * 64, y: v.y - direction[1] * 64 }))
       }
-      const positionOf = id => drag?.id === id ? drag.position : positions.get(id)
+      const positionOf = id => drag?.id === id ? drag.position : (push?.get(id) ?? positions.get(id))
+      // 拖一张卡经过别人时，把挡路的卡沿最短方向实时推开（等价 topic-explorer 的 repelCards 阻尼推挤）。
+      function repel(draggedId, spot) {
+        const place = new Map()
+        for (const [id, position] of positions) if (id !== draggedId) place.set(id, { ...position })
+        const gap = 18
+        for (let round = 0; round < 4; round++) {
+          let moved = false
+          for (const position of place.values()) {
+            const dx = (position.x + CARD_W / 2) - (spot.x + CARD_W / 2)
+            const dy = (position.y + CARD_H / 2) - (spot.y + CARD_H / 2)
+            const overlapX = CARD_W + gap - Math.abs(dx)
+            const overlapY = CARD_H + gap - Math.abs(dy)
+            if (overlapX <= 0 || overlapY <= 0) continue
+            moved = true
+            if (overlapX < overlapY) position.x += (dx > 0 ? 1 : -1) * overlapX
+            else position.y += (dy > 0 ? 1 : -1) * overlapY
+          }
+          if (!moved) break
+        }
+        const result = new Map()
+        for (const [id, position] of place) {
+          const base = positions.get(id)
+          if (Math.abs(position.x - base.x) > 0.5 || Math.abs(position.y - base.y) > 0.5) result.set(id, position)
+        }
+        return result.size ? result : null
+      }
       function worldPoint(event) {
         const box = viewport.current.getBoundingClientRect()
         return {
@@ -427,34 +608,75 @@ window.__ModuleLoader__.load({
       },
       h('div', { className: 'tm-world', style: { transform: 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.zoom + ')' } },
         h('svg', { className: 'tm-edges', 'aria-hidden': true },
-          nodes.flatMap(node => node.parents.map(parent => {
+          visible.flatMap(node => node.parents.map(parent => {
             const a = positionOf(parent), b = positionOf(node.id)
-            const vertical = Math.abs(a.x - b.x) < CARD_W * 0.65
-            const direction = vertical ? Math.sign(b.y - a.y) || 1 : Math.sign(b.x - a.x)
-            const x1 = a.x + (vertical ? CARD_W / 2 : direction > 0 ? CARD_W : 0)
-            const x2 = b.x + (vertical ? CARD_W / 2 : direction > 0 ? 0 : CARD_W)
-            const y1 = a.y + (vertical ? direction > 0 ? CARD_H : 0 : CARD_H / 2)
-            const y2 = b.y + (vertical ? direction > 0 ? 0 : CARD_H : CARD_H / 2)
-            const curve = direction * Math.max(32, Math.abs(vertical ? y2 - y1 : x2 - x1) * 0.42)
+            const ax = a.x + CARD_W / 2, ay = a.y + CARD_H / 2
+            const bx = b.x + CARD_W / 2, by = b.y + CARD_H / 2
+            const dx = bx - ax, dy = by - ay
+            const length = Math.hypot(dx, dy) || 1
+            const ux = dx / length, uy = dy / length
+            const reach = Math.min(CARD_W / 2 / Math.max(Math.abs(ux), 0.0001), CARD_H / 2 / Math.max(Math.abs(uy), 0.0001))
+            const x1 = ax + ux * reach, y1 = ay + uy * reach
+            const x2 = bx - ux * reach, y2 = by - uy * reach
+            const span = Math.max(1, length - reach * 2)
+            const bow = Math.min(64, span * 0.16)
+            const nx = -uy, ny = ux
+            const c1x = x1 + (x2 - x1) * 0.35 + nx * bow, c1y = y1 + (y2 - y1) * 0.35 + ny * bow
+            const c2x = x1 + (x2 - x1) * 0.65 + nx * bow, c2y = y1 + (y2 - y1) * 0.65 + ny * bow
             const active = selected && upper.has(parent) && (upper.has(node.id) || node.id === selected)
               || selected === parent
-            const path = vertical
-              ? 'M' + x1 + ' ' + y1 + 'C' + x1 + ' ' + (y1 + curve) + ' ' + x2 + ' ' + (y2 - curve) + ' ' + x2 + ' ' + y2
-              : 'M' + x1 + ' ' + y1 + 'C' + (x1 + curve) + ' ' + y1 + ' ' + (x2 - curve) + ' ' + y2 + ' ' + x2 + ' ' + y2
+            const path = 'M' + x1 + ' ' + y1 + 'C' + c1x + ' ' + c1y + ' ' + c2x + ' ' + c2y + ' ' + x2 + ' ' + y2
+            const angle = Math.atan2(uy, ux) * 180 / Math.PI
             return h('g', { key: JSON.stringify([parent, node.id]), 'data-path': active ? 'active' : undefined },
-              h('path', { d: path }), h('circle', { cx: x2, cy: y2, r: 3.6 }))
+              h('path', { d: path }),
+              h('path', { className: 'tm-arrow', d: 'M-7 -3.6 L0 0 L-7 3.6', transform: 'translate(' + x2 + ' ' + y2 + ') rotate(' + angle + ')' }))
           })),
+          edges.map(edge => {
+            const from = positions.get('root:' + edge.from), to = positions.get('root:' + edge.to)
+            if (!from || !to) return null
+            const x1 = from.x + CARD_W / 2, y1 = from.y + CARD_H
+            const x2 = to.x + CARD_W / 2, y2 = to.y
+            const bulge = Math.max(36, Math.abs(y2 - y1) * 0.42)
+            const label = '任务 ' + String(edge.back + 1).padStart(2, '0') + ' → 任务 ' + String(edge.index + 1).padStart(2, '0')
+              + (edge.hits.length ? '\n共同引用：' + edge.hits.map(ref => ref.text).join('、') : '\n承接上一段')
+            return h('path', {
+              key: 'ref-' + edge.from + '-' + edge.to, className: 'tm-mission-link',
+              d: 'M' + x1 + ' ' + y1 + 'C' + (x1 + bulge) + ' ' + y1 + ' ' + (x2 + bulge) + ' ' + y2 + ' ' + x2 + ' ' + y2,
+            }, h('title', null, label))
+          }),
+          visible.filter(node => node.root).map((root, at, list) => {
+            const next = list[at + 1]
+            if (!next) return null
+            const from = positions.get(root.id)
+            const to = positions.get(next.id)
+            if (!from || !to) return null
+            let bottom = from.y + CARD_H
+            for (const node of visible) {
+              if (node.root || node.group !== root.group) continue
+              const spot = positions.get(node.id)
+              if (spot) bottom = Math.max(bottom, spot.y + CARD_H)
+            }
+            const x = from.x + CARD_W / 2
+            const y1 = bottom + 12
+            const y2 = to.y - 14
+            if (y2 <= y1) return null
+            return h('g', { key: 'band-' + root.key + '-' + next.key },
+              h('path', { className: 'tm-band-link', d: 'M' + x + ' ' + y1 + 'L' + x + ' ' + (y2 - 7) }),
+              h('path', { className: 'tm-band-link', d: 'M-5.5 -7 L0 0 L5.5 -7', transform: 'translate(' + x + ' ' + y2 + ')' }))
+          }),
           link && h('path', { className: 'tm-link', d: 'M' + (positionOf(link.from).x + CARD_W) + ' ' + (positionOf(link.from).y + CARD_H / 2)
             + 'L' + link.x + ' ' + link.y })),
-        nodes.map(node => {
+        visible.map(node => {
           const root = node.root === true
           const index = node.order ?? 0
           const p = positionOf(node.id)
           const current = selected === node.id
           const live = !root && running && activeId === node.id
           return h('div', { className: 'tm-node', key: node.id, style: { left: p.x, top: p.y },
-            'data-root': root || undefined, 'data-status': node.status, 'data-live': live || undefined,
+            'data-root': root || undefined, 'data-current': root && node.key === currentKey || undefined,
+            'data-status': node.status, 'data-live': live || undefined,
             'data-selected': current || undefined,
+            'data-dragging': drag?.id === node.id || undefined,
             'data-muted': !root && selected && !focusPath.has(node.id) || undefined },
           !root && h('span', {
             className: 'tm-port', role: 'button', title: '拖到另一个方块，建立连接',
@@ -476,7 +698,8 @@ window.__ModuleLoader__.load({
           h('span', { className: 'tm-card-top' },
             h('span', { className: 'tm-kind' }, root ? icons('map', 17) :
               h('span', { className: 'tm-card-no' }, String(index).padStart(2, '0'))),
-            root ? '任务 ' + String(index).padStart(2, '0') : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
+            root ? '任务 ' + String(index).padStart(2, '0') + (node.key === currentKey ? ' · 当前' : '')
+              : live ? '回答中' : node.source ? statusLabels[node.status] : '手动步骤',
             !root && (live || node.status === 'in_progress') && h('span', { className: 'tm-live', 'aria-label': live ? '正在回答' : '进行中' }),
             !root && icons('grip', 15)),
           h('span', { className: 'tm-card-title' }, node.title),
@@ -484,7 +707,14 @@ window.__ModuleLoader__.load({
             icons(approved.has(node.id) ? 'check' : node.guides.length ? 'guide' : statusIcons[node.status], 14),
             approved.has(node.id) && h('span', null, '已认可'),
             approved.has(node.id) && node.guides.length > 0 && h('span', null, '·'),
-            node.guides.length ? node.guides.length + ' 条 Guide' : null)))
+            node.guides.length ? node.guides.length + ' 条 Guide' : null)),
+          root && edges.some(edge => edge.to === node.key) && h('div', { className: 'tm-ref-row' },
+            edges.filter(edge => edge.to === node.key).map(edge => h('span', {
+              key: 'ref-' + edge.from, className: 'tm-ref-chip', role: 'button', tabIndex: 0,
+              title: edge.hits.length ? '共同引用：' + edge.hits.map(ref => ref.text).join('、') : '承接上一段',
+              onPointerDown: event => event.stopPropagation(),
+              onClick: event => { event.stopPropagation(); focusMission(edge.from) },
+            }, '↩ 任务 ' + String(edge.back + 1).padStart(2, '0')))))
         })),
       h('div', { className: 'tm-dock', 'aria-label': '画布工具' },
         h(Action, { icon: 'minus', label: '缩小', onClick: () => zoomBy(1 / 1.2) }),
@@ -500,7 +730,13 @@ window.__ModuleLoader__.load({
           }),
         }, icons('square', 18)),
         h('span', { className: 'tm-dock-divider' }),
-        h(Action, { icon: 'fit', label: '适配画布', onClick: () => { manual.current = false; fit() } })))
+        h('button', {
+          type: 'button', className: 'tm-locate', title: '居中到进行中的卡片，并把相关卡片排到周围',
+          'aria-label': '居中到进行中的卡片', 'data-active': focus ? true : undefined,
+          onClick: locate,
+        }, icons('target', 18)),
+        focus && h('span', { className: 'tm-focus', title: '聚焦相关卡片，点「适配画布」返回全图' }, '聚焦'),
+        h(Action, { icon: 'fit', label: '适配画布', onClick: () => { setFocus(null); manual.current = false; fit() } })))
     }
 
     function Inspector({ node, nodes, close, update, remove, sending, canSend, running, send, notification, guideFocus, autoComplete, onAutoComplete }) {
@@ -633,7 +869,10 @@ window.__ModuleLoader__.load({
 
     function Workbench({ sessionId, identity, groups, title, usage, running, canSend, sendPrompt, openChat }) {
       const storageKey = 'dsh-task-map:v1:' + sessionId + ':' + identity
-      const allTodos = groups.flatMap(group => Array.isArray(group.todos) ? group.todos : [])
+      const [scope, setScope] = useState(() => (readEdits(storageKey).scope === 'all' ? 'all' : 'current'))
+      const [focus, setFocus] = useState(null)
+      const shown = scope === 'all' || groups.length < 2 ? groups : groups.slice(-1)
+      const allTodos = shown.flatMap(group => Array.isArray(group.todos) ? group.todos : [])
       const [edits, setEdits] = useState(() => readEdits(storageKey))
       const editsRef = useRef(edits)
       const [selected, setSelected] = useState(() => {
@@ -648,7 +887,8 @@ window.__ModuleLoader__.load({
       const [planRequested, setPlanRequested] = useState(false)
       const [active, setActive] = useState(null)
       const requestLock = useRef(false)
-      const nodes = useMemo(() => makeGraph(groups, edits), [groups, edits])
+      const nodes = useMemo(() => makeGraph(shown, edits), [shown, edits])
+      const edges = useMemo(() => missionEdges(shown), [shown])
       const activeRef = useRef(null)
       const nodesRef = useRef(nodes)
       const wasRunning = useRef(running)
@@ -657,14 +897,19 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const ended = wasRunning.current && !running
         wasRunning.current = running
-        if (!ended) return
-        const id = activeRef.current?.id
-        const target = id ? nodesRef.current.find(item => item.id === id) : null
-        if (!target || target.status === 'completed' || editsRef.current.autoComplete === false) return
-        commit(previous => ({
-          ...previous,
-          overrides: { ...previous.overrides, [id]: { ...previous.overrides[id], status: 'completed', autoDone: true } },
-        }))
+        if (!ended || editsRef.current.autoComplete === false) return
+        const current = shown[shown.length - 1]?.key
+        const ids = new Set()
+        for (const item of nodesRef.current) {
+          if (item.root || item.status === 'completed') continue
+          if (item.id === activeRef.current?.id || item.group === current && item.status === 'in_progress') ids.add(item.id)
+        }
+        if (!ids.size) return
+        commit(previous => {
+          const overrides = { ...previous.overrides }
+          for (const id of ids) overrides[id] = { ...overrides[id], status: 'completed', autoDone: true }
+          return { ...previous, overrides }
+        })
       }, [running])
       const node = nodes.find(n => n.id === selected)
       const visibleSelection = node ? node.id : selected === ROOT ? ROOT : null
@@ -778,10 +1023,16 @@ window.__ModuleLoader__.load({
             h('div', null, h('h2', null, '任务地图', running && h('span', { className: 'tm-live', 'aria-label': '正在运行' })),
               allTodos.length ? h('p', null, completed + ' / ' + allTodos.length) : null)),
           h('div', { className: 'tm-heading-actions' },
+            groups.length > 1 && h('div', { className: 'tm-scope', role: 'group', 'aria-label': '显示范围' },
+              h('button', { type: 'button', className: 'tm-scope-button', 'data-active': scope !== 'all' || undefined,
+                onClick: () => { setFocus(null); setScope('current'); commit(previous => ({ ...previous, scope: 'current' })) } }, '当前'),
+              h('button', { type: 'button', className: 'tm-scope-button', 'data-active': scope === 'all' || undefined,
+                onClick: () => { setFocus(null); setScope('all'); commit(previous => ({ ...previous, scope: 'all' })) } }, '全部')),
             h(Usage, { usage }))),
         h('div', { className: 'tm-workbench' },
-          h(Canvas, { nodes, title, selected: visibleSelection, select: choose, add, connect, remove, openGuide,
-            running, activeId: active?.id,
+          h(Canvas, { key: 'canvas-' + scope, nodes, title, selected: visibleSelection, select: choose, add, connect, remove, openGuide, edges,
+            currentKey: shown.length ? shown[shown.length - 1].key : undefined,
+            running, activeId: active?.id, focus, setFocus,
             move: (id, position) => modify(id, { position }), onBlank: () => choose(null) }),
           node && h(Inspector, { key: node.id, node, nodes, running, sending, canSend, guideFocus,
             autoComplete: edits.autoComplete !== false,
@@ -809,10 +1060,14 @@ window.__ModuleLoader__.load({
       const missions = Array.isArray(projection.missions) ? projection.missions : []
       const groups = missions
         .filter(mission => Array.isArray(mission.todos) && mission.todos.length)
-        .map(mission => ({ key: mission.key, title: mission.title }))
+        .map((mission, at, list) => ({
+          key: mission.key, title: mission.title, refs: mission.refs ?? [],
+          todos: at === list.length - 1 ? mission.todos
+            : mission.todos.map(todo => todo.status === 'in_progress' ? { ...todo, status: 'pending' } : todo),
+        }))
       if (!groups.length) {
         const todos = Array.isArray(canonicalTodos) && canonicalTodos.length ? canonicalTodos : projection.plan?.todos ?? EMPTY_TODOS
-        if (todos.length) groups.push({ key: projection.plan?.key ?? 'current', title: projection.task?.title ?? projection.plan?.title ?? '' })
+        if (todos.length) groups.push({ key: projection.plan?.key ?? 'current', title: projection.task?.title ?? projection.plan?.title ?? '', todos, refs: [] })
       }
       const latest = missions[missions.length - 1]
       const title = latest?.title || projection.task?.title || projection.plan?.title
